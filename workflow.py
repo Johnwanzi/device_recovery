@@ -717,13 +717,15 @@ def run_step1_once(attempt_no: int) -> bool:
         if not do_file_write(dev, ROMLOADER_BIN, "vol0:romloader.bin", CHUNK_STEP1):
             return False
 
+        log("INFO", "Waiting 1s between 1.4 and 1.5...")
+        time.sleep(1.0)
+
         substep("1.5", f"FileWrite bin/pro2_boot_update_rom_signed.bin -> vol0:update_rom.bin (chunk {CHUNK_STEP1})")
         if not do_file_write(dev, UPDATE_ROM_BIN, "vol0:update_rom.bin", CHUNK_STEP1):
             return False
 
-        substep("1.6", "FirmwareUpdate type=1 path=vol0:update_rom.bin")
-        if not do_firmware_update_check(dev, target_id=1, path="vol0:update_rom.bin",
-                                        reboot_on_success=False, timeout_s=120):
+        substep("1.6", "FirmwareUpdate type=1 path=vol0:update_rom.bin (wait progress=100%)")
+        if not do_firmware_update_wait_progress(dev, target_id=1, path="vol0:update_rom.bin"):
             return False
 
         substep("1.7", f"Reboot type=0, then wait {STEP1_POST_REBOOT_S}s")
