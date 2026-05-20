@@ -1,0 +1,45 @@
+# ==================== Python ====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# build artifacts
+build/
+dist/
+*.egg
+*.whl
+
+# ==================== Editors / IDEs ====================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ==================== OS junk ====================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==================== Project-local ====================
+# scratch dir used by copy_assets.py benchmarks / dry-runs
+_testdest/
+
+# misc local files
+*.log
+*.tmp
+*.bak
