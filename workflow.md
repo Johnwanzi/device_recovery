@@ -17,7 +17,7 @@
 ## step3 update bluetooth
 - 1.判断设备是否连接，如果连接直接跳到下一步；否则先尝试连接设备，超时时间 1 分钟，连接成功执行下一步
 - 2.ping 设备，超时时间 1 分钟，ping 通后等待5秒，执行下一步
-- 3.检查 vol0:bluetooth.bin 文件是否存在，如果存在则执行下一步，否则将 bin/pro2_bluetooth_signed.bin 文件通过 file write 写入路径 vol0:bluetooth.bin, 写入成功执行下一步，否则返回第一步
+- 3.检查 vol0:bluetooth.bin 文件是否存在，如果存在则执行下一步，如果指令超时或者不存在则将 bin/pro2_bluetooth_signed.bin 文件通过 file write 写入路径 vol0:bluetooth.bin, 写入成功执行下一步，否则返回第一步
 - 4.执行 firmware update 指令，类型为 2，路径为 vol0:bluetooth.bin，这里不判断firmware update执行结果，直接等待 FirmwareInstallProgress 返回 100%, 则认为成功，然后进入下一步
 - 5.先等待 5 秒，然后进入 step4
 
@@ -26,7 +26,7 @@
 - 2.执行 reboot 指令，类型为 1，执行成功后 1 秒进入下一步，否则返回第一步
 - 3.再尝试连接设备，超时时间 1 分钟，连接成功执行下一步
 - 4.ping 设备，超时时间 1 分钟，ping 通后等待5秒，执行下一步
-- 5.检查 vol0:core.bin 文件是否存在，如果存在则执行下一步，否则将 bin/pro2_firmware_signed.bin 文件通过 file write 写入路径 vol0:core.bin，成功执行下一步，否则退出
+- 5.检查 vol0:core.bin 文件是否存在，如果存在则执行下一步，如果指令超时或者不存在则将 bin/pro2_firmware_signed.bin 文件通过 file write 写入路径 vol0:core.bin，成功执行下一步，否则退出
 - 6.执行 firmware update 指令，类型为 1，路径为 vol0:core.bin，这里不判断firmware update执行结果，直接等待 FirmwareInstallProgress 返回 100%, 则认为成功，然后进入下一步
 - 7.先等待 10 秒，然后尝试连接设备，超时时间 30 秒
 

@@ -1028,17 +1028,21 @@ def run_step3_once(attempt_no: int, dev_in: Optional[WebUsbDevice] = None) -> bo
         log("INFO", f"Ping OK, waiting {STEP3_POST_PING_WAIT_S}s before next step...")
         time.sleep(STEP3_POST_PING_WAIT_S)
 
-        substep("3.3", "Ensure vol0:bluetooth.bin exists (write bin/pro2_bluetooth_signed.bin if missing)")
+        substep("3.3", "Ensure vol0:bluetooth.bin exists (write bin/pro2_bluetooth_signed.bin if missing or query timed out)")
         info = do_path_info(dev, "vol0:bluetooth.bin")
-        if info is None:
-            return False
-        if info["exist"]:
+        # workflow.md: 如果指令超时或者不存在 -> write the bin. info=None covers
+        # PathInfo timeout / Failure / unexpected reply; treat all as "needs write".
+        needs_write = info is None or not info.get("exist", False)
+        if not needs_write:
             log("INFO", "vol0:bluetooth.bin already exists; skipping file_write")
         else:
+            if info is None:
+                log("INFO", "PathInfo query failed/timed out for vol0:bluetooth.bin; treating as missing and writing")
+            else:
+                log("INFO", f"vol0:bluetooth.bin missing; writing {BLUETOOTH_BIN}")
             if not os.path.isfile(BLUETOOTH_BIN):
                 log("FAIL", f"Bluetooth bin missing on host: {BLUETOOTH_BIN}")
                 return False
-            log("INFO", f"vol0:bluetooth.bin missing; writing {BLUETOOTH_BIN}")
             if not do_file_write(dev, BLUETOOTH_BIN, "vol0:bluetooth.bin", CHUNK_STEP3):
                 return False
 
@@ -1121,16 +1125,20 @@ def run_step4_once(attempt_no: int) -> bool:
         log("INFO", f"Ping OK, waiting {STEP4_POST_PING_WAIT_S}s before next step...")
         time.sleep(STEP4_POST_PING_WAIT_S)
 
-        substep("4.5", "Ensure vol0:core.bin exists (write bin/pro2_firmware_signed.bin if missing)")
+        substep("4.5", "Ensure vol0:core.bin exists (write bin/pro2_firmware_signed.bin if missing or query timed out)")
         info = do_path_info(dev, "vol0:core.bin")
-        if info is None:
-            raise WorkflowFatal("PathInfo query for vol0:core.bin failed; aborting workflow.")
-        if info["exist"]:
+        # workflow.md: 如果指令超时或者不存在 -> write the bin. info=None covers
+        # PathInfo timeout / Failure / unexpected reply; treat all as "needs write".
+        needs_write = info is None or not info.get("exist", False)
+        if not needs_write:
             log("INFO", "vol0:core.bin already exists; skipping file_write")
         else:
+            if info is None:
+                log("INFO", "PathInfo query failed/timed out for vol0:core.bin; treating as missing and writing")
+            else:
+                log("INFO", f"vol0:core.bin missing; writing {FIRMWARE_BIN}")
             if not os.path.isfile(FIRMWARE_BIN):
                 raise WorkflowFatal(f"firmware bin missing on host: {FIRMWARE_BIN}")
-            log("INFO", f"vol0:core.bin missing; writing {FIRMWARE_BIN}")
             if not do_file_write(dev, FIRMWARE_BIN, "vol0:core.bin", CHUNK_STEP1):
                 raise WorkflowFatal("Failed to write vol0:core.bin; aborting workflow.")
 
