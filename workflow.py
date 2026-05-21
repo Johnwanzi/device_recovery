@@ -8,6 +8,14 @@ Usage:
     python workflow_step1.py step3     # only step3
     python workflow_step1.py step4     # only step4
 
+Standalone prelude (step2/step3 only, NOT when run via "all"):
+  Per workflow.md "要求": before the step body, do
+    connect (60s) -> reboot type=1 -> wait 1s -> reconnect (60s)
+  The reconnected handle is then handed into the step body so it can skip
+  its own initial connect.
+  step4 already embeds this sequence in its own body (4.1-4.3), so it does
+  not get an extra standalone prelude.
+
 step1 - update romloader
   1) connect device                       (timeout 60s)
   2) ping device                          (timeout 60s)
@@ -22,23 +30,19 @@ step1 - update romloader
 
 step2 - update resources
   1) connect device                       (timeout 60s)
-  2) reboot type=1, then wait 3s; on failure retry from (1)
-  3) connect device again                 (timeout 60s)
-  4) wait for OneKey OS volume to appear on the host (timeout 30s), then wait 3s
-  5) copy ./assets to the OneKey OS MSC volume via copy_assets.py
+  2) wait for OneKey OS volume to appear on the host (timeout 30s), then wait 3s
+  3) copy ./assets to the OneKey OS MSC volume via copy_assets.py
        (pass the discovered mount as --dest, then wipe + mirror)
        wait 3 seconds after copy completes; on failure the workflow EXITS (no retry)
-  6) enter step3
+  4) enter step3
 
 step3 - update bluetooth
-  1) connect device                       (timeout 60s)
-  2) reboot type=1, then wait 1s; on failure retry from (1)
-  3) connect device again                 (timeout 60s)
-  4) ping device                          (timeout 60s), then wait 5s
-  5) check vol0:bluetooth.bin; if missing, file_write bin/pro2_bluetooth_signed.bin
-  6) firmware_update type=2 path=vol0:bluetooth.bin
+  1) if device already connected, skip; else connect (timeout 60s)
+  2) ping device                          (timeout 60s), then wait 5s
+  3) check vol0:bluetooth.bin; if missing, file_write bin/pro2_bluetooth_signed.bin
+  4) firmware_update type=2 path=vol0:bluetooth.bin
        (do not check result, wait for FirmwareInstallProgress=100%)
-  7) wait 5s, then enter step4
+  5) wait 5s, then enter step4
 
 step4 - update firmware
   1) connect device                       (timeout 60s)
@@ -188,19 +192,22 @@ COPY_ASSETS_SCRIPT  = os.path.join(_BASE_DIR, "copy_assets.py")
 COPY_ASSETS_TIMEOUT_S = 600
 COPY_ASSETS_WORKERS = 8
 STEP2_VOLUME_WAIT_S = 30  # timeout for OneKey OS volume to appear on host (step2)
-STEP2_POST_REBOOT_WAIT_S = 3  # delay after reboot type=1 in step2, before reconnect
 STEP2_POST_VOLUME_WAIT_S = 3  # delay after volume appears, before copy_assets (step2)
 STEP2_POST_COPY_WAIT_S = 3  # delay after copy_assets completes, before step3
-STEP3_POST_REBOOT_WAIT_S = 1  # delay after reboot type=1 in step3, before reconnect
 STEP3_POST_PING_WAIT_S = 5  # delay after ping succeeds in step3, before next step
 STEP3_POST_COMPLETE_WAIT_S = 5  # delay at end of step3, before step4
-STEP4_POST_REBOOT_WAIT_S = 1  # delay after reboot type=1 in step4, before reconnect
 STEP4_POST_PING_WAIT_S = 5  # delay after ping succeeds in step4, before next step
+STEP4_POST_REBOOT_WAIT_S = 1  # delay after reboot type=1 in step4, before reconnect
 STEP1_POST_REBOOT_S = 20
 STEP1_POST_REBOOT2_S = 40   # second reboot wait at end of step1, before step2
 STEP1_BOOT_LOGO_PATH = "vol0:assets/boot/boot_logo.bin"  # checked-and-deleted at start of step1
 STEP4_PRE_CONNECT_S = 10  # delay after firmware_update, before final connect (step4)
 STEP4_FINAL_CONNECT_TIMEOUT_S = 30
+
+# When step2/3/4 is invoked STANDALONE (not via run_all), workflow.md requires:
+#   connect -> reboot type=1 -> wait 1s -> reconnect (60s)
+# before the step's own body runs.
+STANDALONE_POST_REBOOT_WAIT_S = 1
 
 # How long to keep waiting for "progress reaches 100%" after firmware_update is dispatched.
 PROGRESS_WAIT_S = 600
@@ -688,6 +695,37 @@ def do_reboot(dev: WebUsbDevice, reboot_type: int = 0) -> bool:
         return False
 
 
+# ==================== standalone prelude ====================
+
+def run_standalone_prelude(step_label: str) -> Optional[WebUsbDevice]:
+    """Per workflow.md, step2/3/4 invoked standalone must:
+      connect -> reboot type=1 -> wait 1s -> reconnect (60s)
+    Returns the reconnected dev handle, or None on failure (caller should treat
+    None as a fatal precondition failure for the standalone run).
+    """
+    stage(f"{step_label} standalone prelude - reboot type=1 then reconnect")
+    dev: Optional[WebUsbDevice] = None
+    try:
+        substep(f"{step_label}.pre.1", "Connect device (timeout 60s)")
+        dev = wait_connect(CONNECT_TIMEOUT_S, label=f"{step_label}.prelude.connect-1")
+
+        substep(f"{step_label}.pre.2", f"Reboot type=1, then wait {STANDALONE_POST_REBOOT_WAIT_S}s")
+        if not do_reboot(dev, reboot_type=1):
+            safe_close(dev)
+            return None
+        safe_close(dev)
+        dev = None
+        time.sleep(STANDALONE_POST_REBOOT_WAIT_S)
+
+        substep(f"{step_label}.pre.3", "Re-connect device (timeout 60s)")
+        dev = wait_connect(CONNECT_TIMEOUT_S, label=f"{step_label}.prelude.connect-2")
+        return dev
+    except Exception as e:
+        log("FAIL", f"{step_label} standalone prelude exception: {e}")
+        safe_close(dev)
+        return None
+
+
 # ==================== asset enumeration ====================
 
 def wait_for_volume(label: str = ONEKEY_VOLUME_LABEL,
@@ -896,24 +934,17 @@ def run_step1(max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> int:
 
 # ==================== STEP 2 ====================
 
-def run_step2_once(attempt_no: int) -> bool:
+def run_step2_once(attempt_no: int, dev_in: Optional[WebUsbDevice] = None) -> bool:
     stage(f"STEP2 attempt #{attempt_no} - update resources")
-    dev: Optional[WebUsbDevice] = None
+    dev: Optional[WebUsbDevice] = dev_in
     try:
-        substep("2.1", "Connect device (timeout 60s)")
-        dev = wait_connect(CONNECT_TIMEOUT_S, label="step2.connect-1")
+        substep("2.1", "Ensure device connected (reuse if already connected, else connect 60s)")
+        if dev is None:
+            dev = wait_connect(CONNECT_TIMEOUT_S, label="step2.connect")
+        else:
+            log("INFO", "Device already connected; reusing existing handle")
 
-        substep("2.2", f"Reboot type=1, then wait {STEP2_POST_REBOOT_WAIT_S}s")
-        if not do_reboot(dev, reboot_type=1):
-            return False
-        safe_close(dev)
-        dev = None
-        time.sleep(STEP2_POST_REBOOT_WAIT_S)
-
-        substep("2.3", "Re-connect device (timeout 60s)")
-        dev = wait_connect(CONNECT_TIMEOUT_S, label="step2.connect-2")
-
-        substep("2.4", f"Wait for OneKey OS volume (timeout {STEP2_VOLUME_WAIT_S}s), then wait {STEP2_POST_VOLUME_WAIT_S}s")
+        substep("2.2", f"Wait for OneKey OS volume (timeout {STEP2_VOLUME_WAIT_S}s), then wait {STEP2_POST_VOLUME_WAIT_S}s")
         # Release the WebUSB handle so the OS can mount MSC for copy_assets.
         safe_close(dev)
         dev = None
@@ -923,7 +954,7 @@ def run_step2_once(attempt_no: int) -> bool:
         log("INFO", f"Volume ready, waiting {STEP2_POST_VOLUME_WAIT_S}s before copy_assets...")
         time.sleep(STEP2_POST_VOLUME_WAIT_S)
 
-        substep("2.5", f"Copy ./assets to {mount} via copy_assets.py, then wait {STEP2_POST_COPY_WAIT_S}s")
+        substep("2.3", f"Copy ./assets to {mount} via copy_assets.py, then wait {STEP2_POST_COPY_WAIT_S}s")
         if not os.path.isdir(ASSETS_DIR):
             raise WorkflowFatal(f"Assets dir missing: {ASSETS_DIR}")
         if not os.path.isfile(COPY_ASSETS_SCRIPT):
@@ -947,7 +978,7 @@ def run_step2_once(attempt_no: int) -> bool:
         safe_close(dev)
 
 
-def run_step2(max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> int:
+def run_step2(max_attempts: int = DEFAULT_MAX_ATTEMPTS, standalone: bool = False) -> int:
     stage("Workflow START - step2: update resources")
     log("INFO", f"Assets dir    : {ASSETS_DIR}")
     log("INFO", f"Volume label  : \"{ONEKEY_VOLUME_LABEL}\"")
@@ -957,8 +988,17 @@ def run_step2(max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> int:
         log("FAIL", f"Required dir missing: {ASSETS_DIR}")
         return 2
 
+    prelude_dev: Optional[WebUsbDevice] = None
+    if standalone:
+        prelude_dev = run_standalone_prelude("step2")
+        if prelude_dev is None:
+            stage("STEP2 FAILED")
+            return 1
+
     for i in range(1, max_attempts + 1):
-        if run_step2_once(i):
+        carry = prelude_dev if i == 1 else None
+        prelude_dev = None  # only consumed once
+        if run_step2_once(i, dev_in=carry):
             stage("STEP2 SUCCESS")
             return 0
         if i < max_attempts:
@@ -972,30 +1012,23 @@ def run_step2(max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> int:
 
 # ==================== STEP 3 ====================
 
-def run_step3_once(attempt_no: int) -> bool:
+def run_step3_once(attempt_no: int, dev_in: Optional[WebUsbDevice] = None) -> bool:
     stage(f"STEP3 attempt #{attempt_no} - update bluetooth")
-    dev: Optional[WebUsbDevice] = None
+    dev: Optional[WebUsbDevice] = dev_in
     try:
-        substep("3.1", "Connect device (timeout 60s)")
-        dev = wait_connect(CONNECT_TIMEOUT_S, label="step3.connect-1")
+        substep("3.1", "Ensure device connected (reuse if already connected, else connect 60s)")
+        if dev is None:
+            dev = wait_connect(CONNECT_TIMEOUT_S, label="step3.connect")
+        else:
+            log("INFO", "Device already connected; reusing existing handle")
 
-        substep("3.2", f"Reboot type=1, then wait {STEP3_POST_REBOOT_WAIT_S}s")
-        if not do_reboot(dev, reboot_type=1):
-            return False
-        safe_close(dev)
-        dev = None
-        time.sleep(STEP3_POST_REBOOT_WAIT_S)
-
-        substep("3.3", "Re-connect device (timeout 60s)")
-        dev = wait_connect(CONNECT_TIMEOUT_S, label="step3.connect-2")
-
-        substep("3.4", f"Ping device (timeout 60s), then wait {STEP3_POST_PING_WAIT_S}s")
+        substep("3.2", f"Ping device (timeout 60s), then wait {STEP3_POST_PING_WAIT_S}s")
         if not do_ping(dev, PING_TIMEOUT_S, tag="step3"):
             return False
         log("INFO", f"Ping OK, waiting {STEP3_POST_PING_WAIT_S}s before next step...")
         time.sleep(STEP3_POST_PING_WAIT_S)
 
-        substep("3.5", "Ensure vol0:bluetooth.bin exists (write bin/pro2_bluetooth_signed.bin if missing)")
+        substep("3.3", "Ensure vol0:bluetooth.bin exists (write bin/pro2_bluetooth_signed.bin if missing)")
         info = do_path_info(dev, "vol0:bluetooth.bin")
         if info is None:
             return False
@@ -1009,11 +1042,11 @@ def run_step3_once(attempt_no: int) -> bool:
             if not do_file_write(dev, BLUETOOTH_BIN, "vol0:bluetooth.bin", CHUNK_STEP3):
                 return False
 
-        substep("3.6", "FirmwareUpdate type=2 path=vol0:bluetooth.bin (wait progress=100%)")
+        substep("3.4", "FirmwareUpdate type=2 path=vol0:bluetooth.bin (wait progress=100%)")
         if not do_firmware_update_wait_progress(dev, target_id=2, path="vol0:bluetooth.bin"):
             return False
 
-        substep("3.7", f"Wait {STEP3_POST_COMPLETE_WAIT_S}s, then enter step4")
+        substep("3.5", f"Wait {STEP3_POST_COMPLETE_WAIT_S}s, then enter step4")
         safe_close(dev)
         dev = None
         log("INFO", f"Waiting {STEP3_POST_COMPLETE_WAIT_S}s before step4...")
@@ -1028,7 +1061,9 @@ def run_step3_once(attempt_no: int) -> bool:
         safe_close(dev)
 
 
-def run_step3(max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> int:
+def run_step3(max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+              dev_in: Optional[WebUsbDevice] = None,
+              standalone: bool = False) -> int:
     stage("Workflow START - step3: update bluetooth")
     log("INFO", f"Bluetooth bin : {BLUETOOTH_BIN}")
     log("INFO", f"Max attempts  : {max_attempts}")
@@ -1037,8 +1072,19 @@ def run_step3(max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> int:
         log("FAIL", f"Required file missing: {BLUETOOTH_BIN}")
         return 2
 
+    if standalone:
+        prelude_dev = run_standalone_prelude("step3")
+        if prelude_dev is None:
+            stage("STEP3 FAILED")
+            return 1
+        dev_in = prelude_dev
+
     for i in range(1, max_attempts + 1):
-        if run_step3_once(i):
+        # Only the first attempt may reuse an incoming device handle; if it fails
+        # we restart from a fresh connect on subsequent attempts.
+        carry = dev_in if i == 1 else None
+        dev_in = None  # only consumed once
+        if run_step3_once(i, dev_in=carry):
             stage("STEP3 SUCCESS")
             return 0
         if i < max_attempts:
@@ -1146,10 +1192,20 @@ def run_all(max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> int:
         return rc
     rc = run_step3(max_attempts)
     if rc != 0:
-        return rc
+        # Fallback: re-run step3 as if invoked standalone (adds the
+        # connect -> reboot type=1 -> wait 1s -> reconnect prelude).
+        log("WARN", "Step3 failed in run_all; retrying once as standalone (with reboot prelude)...")
+        rc = run_step3(max_attempts, standalone=True)
+        if rc != 0:
+            return rc
     rc = run_step4(max_attempts)
     if rc != 0:
-        return rc
+        # step4 already embeds connect -> reboot type=1 -> reconnect in its body,
+        # so "re-running workflow.py step4" is just another run_step4 invocation.
+        log("WARN", "Step4 failed in run_all; retrying step4 once more...")
+        rc = run_step4(max_attempts)
+        if rc != 0:
+            return rc
     stage("ALL STEPS FINISHED SUCCESSFULLY")
     return 0
 
@@ -1178,9 +1234,9 @@ def main() -> int:
         if args.target == "step1":
             return run_step1(args.max_attempts)
         if args.target == "step2":
-            return run_step2(args.max_attempts)
+            return run_step2(args.max_attempts, standalone=True)
         if args.target == "step3":
-            return run_step3(args.max_attempts)
+            return run_step3(args.max_attempts, standalone=True)
         if args.target == "step4":
             return run_step4(args.max_attempts)
     except WorkflowFatal as e:
