@@ -52,14 +52,6 @@ def log(level: str, msg: str) -> None:
     sys.stdout.flush()
 
 
-def format_bytes(n: int) -> str:
-    if n < 1024:
-        return f"{n} B"
-    if n < 1024 * 1024:
-        return f"{n / 1024:.2f} KB"
-    return f"{n / (1024 * 1024):.2f} MB"
-
-
 # ==================== volume discovery ====================
 
 def _norm(s: str) -> str:
@@ -290,12 +282,12 @@ def copy_assets(target: Path, dry_run: bool, workers: int = DEFAULT_WORKERS) -> 
     sized = [(src, rel, src.stat().st_size) for src, rel in files]
     total_files = len(sized)
     total_bytes = sum(s for _, _, s in sized)
-    log("INFO", f"Copying {total_files} files, {format_bytes(total_bytes)} -> {target}  (workers={workers})")
+    log("INFO", f"Copying {total_files} files -> {target}  (workers={workers})")
 
     if dry_run:
-        for idx, (src, rel, size) in enumerate(sized, 1):
-            log("INFO", f"  [{idx}/{total_files}] {rel}  ({format_bytes(size)}) [dry-run]")
-        log("OK", f"Dry-run: would copy {total_files} files, {format_bytes(total_bytes)}")
+        for idx, (src, rel, _size) in enumerate(sized, 1):
+            log("INFO", f"  [{idx}/{total_files}] {rel} [dry-run]")
+        log("OK", f"Dry-run: would copy {total_files} files")
         return total_files, total_bytes
 
     # Pre-create every destination subdirectory in one pass.
@@ -330,20 +322,16 @@ def copy_assets(target: Path, dry_run: bool, workers: int = DEFAULT_WORKERS) -> 
                 copied_bytes += size
             now = time.monotonic()
             if now - last_print >= 0.3 or i == total_files:
-                elapsed = now - t0
-                speed = copied_bytes / elapsed if elapsed > 0 else 0
+                pct = copied * 100.0 / total_files if total_files else 100.0
                 sys.stdout.write(
-                    f"\r  progress: {copied}/{total_files}  "
-                    f"{format_bytes(copied_bytes)} / {format_bytes(total_bytes)}  "
-                    f"{format_bytes(int(speed))}/s   "
+                    f"\r  progress: {copied}/{total_files}  {pct:6.2f}%   "
                 )
                 sys.stdout.flush()
                 last_print = now
 
     sys.stdout.write("\n")
     elapsed = time.monotonic() - t0
-    avg = copied_bytes / elapsed if elapsed > 0 else 0
-    log("OK", f"Done: {copied}/{total_files} files, {format_bytes(copied_bytes)} in {elapsed:.1f}s ({format_bytes(int(avg))}/s)")
+    log("OK", f"Done: {copied}/{total_files} files (100.00%) in {elapsed:.1f}s")
     return copied, copied_bytes
 
 
