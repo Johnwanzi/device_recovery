@@ -41,6 +41,11 @@ DEFAULT_LABEL = "OneKey OS"
 # basenames we never copy from the assets tree
 IGNORED_BASENAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 
+# Read/write buffer for each file. Larger buffers help medium files; tiny files are
+# still dominated by per-file FAT directory updates on USB MSC.
+COPY_BUF_SIZE = 1024 * 1024
+DEFAULT_WORKERS = 8
+
 
 def log(level: str, msg: str) -> None:
     sys.stdout.write(f"[{time.strftime('%H:%M:%S')}] [{level}] {msg}\n")
@@ -225,9 +230,7 @@ def wipe_target(target: Path, dry_run: bool) -> tuple[int, int]:
     dir_count = 0
     for entry in sorted(target.iterdir()):
         if entry.is_dir() and not entry.is_symlink():
-            # count contents for logging
-            n_files = sum(1 for _ in entry.rglob("*") if _.is_file())
-            log("INFO", f"  rm -rf {entry.name}/   ({n_files} files){' [dry-run]' if dry_run else ''}")
+            log("INFO", f"  rm -rf {entry.name}/{' [dry-run]' if dry_run else ''}")
             if not dry_run:
                 shutil.rmtree(entry, onerror=_on_rm_error)
             dir_count += 1
@@ -261,7 +264,17 @@ def enumerate_assets(assets_dir: Path):
             yield abs_src, rel
 
 
-def copy_assets(target: Path, dry_run: bool, workers: int = 8) -> tuple[int, int]:
+def _copy_file_buffered(src: Path, dst: Path, bufsize: int = COPY_BUF_SIZE) -> None:
+    """Copy file data with a large buffer (faster than shutil.copyfile for some FS)."""
+    with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+        while True:
+            chunk = fsrc.read(bufsize)
+            if not chunk:
+                break
+            fdst.write(chunk)
+
+
+def copy_assets(target: Path, dry_run: bool, workers: int = DEFAULT_WORKERS) -> tuple[int, int]:
     """Copy assets/* -> target/*. Returns (files_copied, total_bytes).
 
     For small-file workloads on USB MSC, the bottleneck is per-file FAT metadata
@@ -300,9 +313,7 @@ def copy_assets(target: Path, dry_run: bool, workers: int = 8) -> tuple[int, int
     last_print = t0
 
     def _copy_one(src: Path, rel: Path, size: int) -> int:
-        # shutil.copyfile is fine here -- mkdir was done already, and we don't
-        # actually need to preserve metadata on a FAT MSC volume.
-        shutil.copyfile(src, target / rel)
+        _copy_file_buffered(src, target / rel)
         return size
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -352,8 +363,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="actually perform the wipe + copy (without this, runs as dry-run)")
     p.add_argument("--dry-run", action="store_true",
                    help="force dry-run regardless of --yes")
-    p.add_argument("--workers", "-j", type=int, default=8,
-                   help="parallel copy workers (default 8). Use 1 for serial.")
+    p.add_argument("--workers", "-j", type=int, default=DEFAULT_WORKERS,
+                   help=f"parallel copy workers (default {DEFAULT_WORKERS}).")
+    p.add_argument("--no-wipe", action="store_true",
+                   help="skip wipe step (faster when target is already empty/clean)")
     return p
 
 
@@ -398,12 +411,15 @@ def main() -> int:
 
     # ---- wipe ----
     log("INFO", "=== Step 1: wipe target ===")
-    entries = list(target.iterdir())
-    if not entries:
-        log("INFO", "target already empty")
+    if args.no_wipe:
+        log("INFO", "wipe skipped (--no-wipe)")
     else:
-        log("INFO", f"target currently has {len(entries)} top-level entries; wiping...")
-        wipe_target(target, dry_run=dry_run)
+        entries = list(target.iterdir())
+        if not entries:
+            log("INFO", "target already empty")
+        else:
+            log("INFO", f"target currently has {len(entries)} top-level entries; wiping...")
+            wipe_target(target, dry_run=dry_run)
 
     # ---- copy ----
     log("INFO", "=== Step 2: copy assets ===")

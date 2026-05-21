@@ -2,10 +2,11 @@
 Workflow runner for OneKey Pro 2 update flow (per workflow.md).
 
 Usage:
-    python workflow_step1.py all       # step1 -> step2 -> step3
+    python workflow_step1.py all       # step1 -> step2 -> step3 -> step4
     python workflow_step1.py step1     # only step1
     python workflow_step1.py step2     # only step2
     python workflow_step1.py step3     # only step3
+    python workflow_step1.py step4     # only step4
 
 step1 - update romloader
   1) connect device                       (timeout 60s)
@@ -19,29 +20,36 @@ step1 - update romloader
   9) reboot type=0, then wait 40s, then enter step2
   -> any failure in 3-9 retries from (1)
 
-step2 - update bluetooth
+step2 - update resources
   1) connect device                       (timeout 60s)
-  2) reboot type=1, then wait 1s; on failure retry from (1)
+  2) reboot type=1, then wait 3s; on failure retry from (1)
   3) connect device again                 (timeout 60s)
-  4) ping device                          (timeout 60s)
-  5) file_write bin/pro2_bluetooth_signed.bin -> vol0:bluetooth.bin   (chunk 1024)
-  6) firmware_update type=2 path=vol0:bluetooth.bin
-       (do not check result, wait for FirmwareInstallProgress=100%)
-  7) wait 5s, then enter step3
-
-step3 - update resources & firmware
-  1) connect device                       (timeout 60s)
-  2) reboot type=1, then wait 1s; on failure retry from (1)
-  3) connect device again                 (timeout 60s)
-  4) wait for OneKey OS volume to appear on the host (timeout 30s)
+  4) wait for OneKey OS volume to appear on the host (timeout 30s), then wait 3s
   5) copy ./assets to the OneKey OS MSC volume via copy_assets.py
        (pass the discovered mount as --dest, then wipe + mirror)
        wait 3 seconds after copy completes; on failure the workflow EXITS (no retry)
-  6) check vol0:core.bin; if missing, file_write bin/pro2_firmware_signed.bin -> vol0:core.bin
-       (failure here also EXITS the workflow)
-  7) firmware_update type=1 path=vol0:core.bin
+  6) enter step3
+
+step3 - update bluetooth
+  1) connect device                       (timeout 60s)
+  2) reboot type=1, then wait 1s; on failure retry from (1)
+  3) connect device again                 (timeout 60s)
+  4) ping device                          (timeout 60s), then wait 5s
+  5) check vol0:bluetooth.bin; if missing, file_write bin/pro2_bluetooth_signed.bin
+  6) firmware_update type=2 path=vol0:bluetooth.bin
        (do not check result, wait for FirmwareInstallProgress=100%)
-  8) wait 10s, then connect device        (timeout 30s)
+  7) wait 5s, then enter step4
+
+step4 - update firmware
+  1) connect device                       (timeout 60s)
+  2) reboot type=1, then wait 1s; on failure retry from (1)
+  3) connect device again                 (timeout 60s)
+  4) ping device                          (timeout 60s), then wait 5s
+  5) check vol0:core.bin; if missing, file_write bin/pro2_firmware_signed.bin -> vol0:core.bin
+       (failure here EXITS the workflow)
+  6) firmware_update type=1 path=vol0:core.bin
+       (do not check result, wait for FirmwareInstallProgress=100%)
+  7) wait 10s, then connect device        (timeout 30s)
 """
 
 import argparse
@@ -174,22 +182,25 @@ ASSETS_DIR     = os.path.join(_BASE_DIR, "assets")
 CONNECT_TIMEOUT_S = 60
 PING_TIMEOUT_S = 60
 CHUNK_STEP1 = 1024  # file_write chunk used for step1 (romloader / update_rom)
-CHUNK_STEP2 = 1024  # file_write chunk used for step2 (bluetooth)
-# step 2.5 / 2.6: detect MSC volume + copy_assets.py to mirror ./assets
+CHUNK_STEP3 = 1024  # file_write chunk used for step3 (bluetooth)
 ONEKEY_VOLUME_LABEL = "OneKey OS"
 COPY_ASSETS_SCRIPT  = os.path.join(_BASE_DIR, "copy_assets.py")
 COPY_ASSETS_TIMEOUT_S = 600
-POST_REBOOT_TYPE1_WAIT_S = 1.0  # brief wait after reboot type=1 before reconnect
-STEP2_VOLUME_WAIT_S = 30  # timeout for OneKey OS volume to appear on host
-STEP2_VOLUME_SETTLE_S = 1.0  # let OS finish mounting before launching copy_assets subprocess
-STEP2_POST_COPY_WAIT_S = 3  # delay after copy_assets completes, before next step
+COPY_ASSETS_WORKERS = 8
+STEP2_VOLUME_WAIT_S = 30  # timeout for OneKey OS volume to appear on host (step2)
+STEP2_POST_REBOOT_WAIT_S = 3  # delay after reboot type=1 in step2, before reconnect
+STEP2_POST_VOLUME_WAIT_S = 3  # delay after volume appears, before copy_assets (step2)
+STEP2_POST_COPY_WAIT_S = 3  # delay after copy_assets completes, before step3
+STEP3_POST_REBOOT_WAIT_S = 1  # delay after reboot type=1 in step3, before reconnect
+STEP3_POST_PING_WAIT_S = 5  # delay after ping succeeds in step3, before next step
+STEP3_POST_COMPLETE_WAIT_S = 5  # delay at end of step3, before step4
+STEP4_POST_REBOOT_WAIT_S = 1  # delay after reboot type=1 in step4, before reconnect
+STEP4_POST_PING_WAIT_S = 5  # delay after ping succeeds in step4, before next step
 STEP1_POST_REBOOT_S = 20
 STEP1_POST_REBOOT2_S = 40   # second reboot wait at end of step1, before step2
 STEP1_BOOT_LOGO_PATH = "vol0:assets/boot/boot_logo.bin"  # checked-and-deleted at start of step1
-STEP2_PRE_CONNECT_S = 10
-STEP3_PRE_CONNECT_S = 5
-STEP2_FINAL_CONNECT_TIMEOUT_S = 30
-STEP3_FINAL_CONNECT_TIMEOUT_S = 30
+STEP4_PRE_CONNECT_S = 10  # delay after firmware_update, before final connect (step4)
+STEP4_FINAL_CONNECT_TIMEOUT_S = 30
 
 # How long to keep waiting for "progress reaches 100%" after firmware_update is dispatched.
 PROGRESS_WAIT_S = 600
@@ -491,7 +502,8 @@ def do_firmware_update_check(dev: WebUsbDevice, target_id: int, path: str,
 
 def do_firmware_update_wait_progress(dev: WebUsbDevice, target_id: int, path: str,
                                      max_wait_s: int = PROGRESS_WAIT_S,
-                                     idle_timeout_s: int = PROGRESS_IDLE_S) -> bool:
+                                     idle_timeout_s: int = PROGRESS_IDLE_S,
+                                     ignore_errors: bool = False) -> bool:
     """Send FirmwareUpdate and treat the step as successful as soon as a
     FirmwareInstallProgress frame reports progress >= 100 %.
 
@@ -501,10 +513,16 @@ def do_firmware_update_wait_progress(dev: WebUsbDevice, target_id: int, path: st
         for the success decision
       - returning True only requires progress = 100
       - returning False happens on idle timeout or overall timeout
+
+    When ``ignore_errors`` is True (step4), USB I/O errors and other exceptions during
+    the wait are logged as WARN and the workflow continues (returns True).
     """
     target_label = FW_TARGET_NAME.get(target_id, str(target_id))
     log("INFO", f"FirmwareUpdate target={target_id} ({target_label}) path={path}")
-    log("INFO", "  success criterion: FirmwareInstallProgress reaches 100% (firmware_update reply is ignored)")
+    if ignore_errors:
+        log("INFO", "  success criterion: progress=100% preferred; USB/errors ignored (step4)")
+    else:
+        log("INFO", "  success criterion: FirmwareInstallProgress reaches 100% (firmware_update reply is ignored)")
     state = {"done": False, "last_progress": -1, "last_recv": time.monotonic()}
 
     def _on_any(mt: int, payload: bytes) -> None:
@@ -553,28 +571,43 @@ def do_firmware_update_wait_progress(dev: WebUsbDevice, target_id: int, path: st
             # the step's success log.
             try:
                 dev.drain_unsolicited(500)
-            except Exception:
+            except Exception as e:
                 if state["done"]:
                     pass  # device tearing down post-100%, ignore
+                elif ignore_errors:
+                    log("WARN",
+                        f"FirmwareUpdate I/O during progress wait (ignored): {e} "
+                        f"(last progress={state['last_progress']}%)")
+                    return True
                 else:
                     raise
             if state["done"]:
                 log("OK", f"FirmwareInstallProgress reached 100% -> {target_label} update step SUCCESS")
                 return True
             if time.monotonic() - state["last_recv"] > idle_timeout_s:
-                log("FAIL",
-                    f"FirmwareInstallProgress idle for {idle_timeout_s}s "
-                    f"(last progress={state['last_progress']}%) -> step FAILED")
+                msg = (f"FirmwareInstallProgress idle for {idle_timeout_s}s "
+                       f"(last progress={state['last_progress']}%)")
+                if ignore_errors:
+                    log("WARN", f"{msg} -> ignored, continuing step4")
+                    return True
+                log("FAIL", f"{msg} -> step FAILED")
                 return False
-        log("FAIL",
-            f"FirmwareInstallProgress did not reach 100% within {max_wait_s}s "
-            f"(last progress={state['last_progress']}%) -> step FAILED")
+        msg = (f"FirmwareInstallProgress did not reach 100% within {max_wait_s}s "
+               f"(last progress={state['last_progress']}%)")
+        if ignore_errors:
+            log("WARN", f"{msg} -> ignored, continuing step4")
+            return True
+        log("FAIL", f"{msg} -> step FAILED")
         return False
     except Exception as e:
         # If 100% was already observed, the exception is just the device tearing
         # down USB after success — treat as success and don't print FAIL.
         if state["done"]:
             log("OK", f"FirmwareInstallProgress reached 100% -> {target_label} update step SUCCESS")
+            return True
+        if ignore_errors:
+            log("WARN", f"FirmwareUpdate exception (ignored): {e} "
+                f"(last progress={state['last_progress']}%)")
             return True
         log("FAIL", f"FirmwareUpdate exception: {e}")
         return False
@@ -706,7 +739,7 @@ def do_copy_assets(mount: Optional[str] = None) -> bool:
         cmd += ["--dest", str(mount)]
     else:
         cmd += ["--label", ONEKEY_VOLUME_LABEL]
-    cmd += ["--yes"]
+    cmd += ["--yes", "--workers", str(COPY_ASSETS_WORKERS)]
     log("INFO", f"Launching: {' '.join(cmd)}")
     t0 = time.monotonic()
     try:
@@ -864,42 +897,49 @@ def run_step1(max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> int:
 # ==================== STEP 2 ====================
 
 def run_step2_once(attempt_no: int) -> bool:
-    stage(f"STEP2 attempt #{attempt_no} - update bluetooth")
+    stage(f"STEP2 attempt #{attempt_no} - update resources")
     dev: Optional[WebUsbDevice] = None
     try:
         substep("2.1", "Connect device (timeout 60s)")
         dev = wait_connect(CONNECT_TIMEOUT_S, label="step2.connect-1")
 
-        substep("2.2", f"Reboot type=1, then wait {POST_REBOOT_TYPE1_WAIT_S}s")
+        substep("2.2", f"Reboot type=1, then wait {STEP2_POST_REBOOT_WAIT_S}s")
         if not do_reboot(dev, reboot_type=1):
             return False
         safe_close(dev)
         dev = None
-        time.sleep(POST_REBOOT_TYPE1_WAIT_S)
+        time.sleep(STEP2_POST_REBOOT_WAIT_S)
 
         substep("2.3", "Re-connect device (timeout 60s)")
         dev = wait_connect(CONNECT_TIMEOUT_S, label="step2.connect-2")
 
-        substep("2.4", "Ping device (timeout 60s)")
-        if not do_ping(dev, PING_TIMEOUT_S, tag="step2"):
-            return False
-
-        substep("2.5", f"FileWrite bin/pro2_bluetooth_signed.bin -> vol0:bluetooth.bin (chunk {CHUNK_STEP2})")
-        if not do_file_write(dev, BLUETOOTH_BIN, "vol0:bluetooth.bin", CHUNK_STEP2):
-            return False
-
-        substep("2.6", "FirmwareUpdate type=2 path=vol0:bluetooth.bin (wait progress=100%)")
-        if not do_firmware_update_wait_progress(dev, target_id=2, path="vol0:bluetooth.bin"):
-            return False
-
-        substep("2.7", f"Wait {STEP3_PRE_CONNECT_S}s, then enter step3")
+        substep("2.4", f"Wait for OneKey OS volume (timeout {STEP2_VOLUME_WAIT_S}s), then wait {STEP2_POST_VOLUME_WAIT_S}s")
+        # Release the WebUSB handle so the OS can mount MSC for copy_assets.
         safe_close(dev)
         dev = None
-        log("INFO", f"Waiting {STEP3_PRE_CONNECT_S}s before step3...")
-        time.sleep(STEP3_PRE_CONNECT_S)
+        mount = wait_for_volume(ONEKEY_VOLUME_LABEL, STEP2_VOLUME_WAIT_S)
+        if mount is None:
+            return False
+        log("INFO", f"Volume ready, waiting {STEP2_POST_VOLUME_WAIT_S}s before copy_assets...")
+        time.sleep(STEP2_POST_VOLUME_WAIT_S)
+
+        substep("2.5", f"Copy ./assets to {mount} via copy_assets.py, then wait {STEP2_POST_COPY_WAIT_S}s")
+        if not os.path.isdir(ASSETS_DIR):
+            raise WorkflowFatal(f"Assets dir missing: {ASSETS_DIR}")
+        if not os.path.isfile(COPY_ASSETS_SCRIPT):
+            raise WorkflowFatal(f"copy_assets.py missing: {COPY_ASSETS_SCRIPT}")
+
+        if not do_copy_assets(mount=mount):
+            # workflow.md: any failure here -> EXIT (no retry)
+            raise WorkflowFatal("copy_assets.py failed; aborting workflow.")
+
+        log("INFO", f"Asset copy done, waiting {STEP2_POST_COPY_WAIT_S}s before step3...")
+        time.sleep(STEP2_POST_COPY_WAIT_S)
 
         log("OK", "Step2 finished.")
         return True
+    except WorkflowFatal:
+        raise  # bubble up so the workflow aborts immediately, no retry
     except Exception as e:
         log("FAIL", f"Step2 exception: {e}")
         return False
@@ -908,12 +948,13 @@ def run_step2_once(attempt_no: int) -> bool:
 
 
 def run_step2(max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> int:
-    stage("Workflow START - step2: update bluetooth")
-    log("INFO", f"Bluetooth bin : {BLUETOOTH_BIN}")
+    stage("Workflow START - step2: update resources")
+    log("INFO", f"Assets dir    : {ASSETS_DIR}")
+    log("INFO", f"Volume label  : \"{ONEKEY_VOLUME_LABEL}\"")
     log("INFO", f"Max attempts  : {max_attempts}")
 
-    if not os.path.isfile(BLUETOOTH_BIN):
-        log("FAIL", f"Required file missing: {BLUETOOTH_BIN}")
+    if not os.path.isdir(ASSETS_DIR):
+        log("FAIL", f"Required dir missing: {ASSETS_DIR}")
         return 2
 
     for i in range(1, max_attempts + 1):
@@ -932,83 +973,54 @@ def run_step2(max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> int:
 # ==================== STEP 3 ====================
 
 def run_step3_once(attempt_no: int) -> bool:
-    stage(f"STEP3 attempt #{attempt_no} - update resources & firmware")
+    stage(f"STEP3 attempt #{attempt_no} - update bluetooth")
     dev: Optional[WebUsbDevice] = None
     try:
         substep("3.1", "Connect device (timeout 60s)")
         dev = wait_connect(CONNECT_TIMEOUT_S, label="step3.connect-1")
 
-        substep("3.2", f"Reboot type=1, then wait {POST_REBOOT_TYPE1_WAIT_S}s")
+        substep("3.2", f"Reboot type=1, then wait {STEP3_POST_REBOOT_WAIT_S}s")
         if not do_reboot(dev, reboot_type=1):
             return False
         safe_close(dev)
         dev = None
-        time.sleep(POST_REBOOT_TYPE1_WAIT_S)
+        time.sleep(STEP3_POST_REBOOT_WAIT_S)
 
         substep("3.3", "Re-connect device (timeout 60s)")
         dev = wait_connect(CONNECT_TIMEOUT_S, label="step3.connect-2")
 
-        substep("3.4", f"Wait for OneKey OS volume to appear (timeout {STEP2_VOLUME_WAIT_S}s)")
-        # Release the WebUSB handle before the host treats the device as MSC,
-        # so the OS-side mount and file copy aren't blocked by our claim.
-        safe_close(dev)
-        dev = None
-        mount = wait_for_volume(ONEKEY_VOLUME_LABEL, STEP2_VOLUME_WAIT_S)
-        if mount is None:
+        substep("3.4", f"Ping device (timeout 60s), then wait {STEP3_POST_PING_WAIT_S}s")
+        if not do_ping(dev, PING_TIMEOUT_S, tag="step3"):
             return False
+        log("INFO", f"Ping OK, waiting {STEP3_POST_PING_WAIT_S}s before next step...")
+        time.sleep(STEP3_POST_PING_WAIT_S)
 
-        substep("3.5", f"Copy ./assets to {mount} via copy_assets.py, then wait {STEP2_POST_COPY_WAIT_S}s")
-        if not os.path.isdir(ASSETS_DIR):
-            raise WorkflowFatal(f"Assets dir missing: {ASSETS_DIR}")
-        if not os.path.isfile(COPY_ASSETS_SCRIPT):
-            raise WorkflowFatal(f"copy_assets.py missing: {COPY_ASSETS_SCRIPT}")
-
-        # Give the OS a brief moment to finish setting up the freshly-mounted volume
-        # (label may briefly read empty right after the mount event).
-        time.sleep(STEP2_VOLUME_SETTLE_S)
-
-        if not do_copy_assets(mount=mount):
-            # workflow.md: any failure here -> EXIT (no retry)
-            raise WorkflowFatal("copy_assets.py failed; aborting workflow.")
-
-        log("INFO", f"Asset copy done, waiting {STEP2_POST_COPY_WAIT_S}s before next step...")
-        time.sleep(STEP2_POST_COPY_WAIT_S)
-
-        # Re-open the WebUSB endpoint for the firmware_update command that follows.
-        log("INFO", "Re-connecting WebUSB for firmware_update...")
-        dev = wait_connect(CONNECT_TIMEOUT_S, label="step3.connect-after-copy")
-
-        substep("3.6", "Ensure vol0:core.bin exists (write bin/pro2_firmware_signed.bin if missing)")
-        info = do_path_info(dev, "vol0:core.bin")
+        substep("3.5", "Ensure vol0:bluetooth.bin exists (write bin/pro2_bluetooth_signed.bin if missing)")
+        info = do_path_info(dev, "vol0:bluetooth.bin")
         if info is None:
-            raise WorkflowFatal("PathInfo query for vol0:core.bin failed; aborting workflow.")
+            return False
         if info["exist"]:
-            log("INFO", "vol0:core.bin already exists; skipping file_write")
+            log("INFO", "vol0:bluetooth.bin already exists; skipping file_write")
         else:
-            if not os.path.isfile(FIRMWARE_BIN):
-                raise WorkflowFatal(f"firmware bin missing on host: {FIRMWARE_BIN}")
-            log("INFO", f"vol0:core.bin missing; writing {FIRMWARE_BIN}")
-            if not do_file_write(dev, FIRMWARE_BIN, "vol0:core.bin", CHUNK_STEP1):
-                # workflow.md: 否则退出
-                raise WorkflowFatal("Failed to write vol0:core.bin; aborting workflow.")
+            if not os.path.isfile(BLUETOOTH_BIN):
+                log("FAIL", f"Bluetooth bin missing on host: {BLUETOOTH_BIN}")
+                return False
+            log("INFO", f"vol0:bluetooth.bin missing; writing {BLUETOOTH_BIN}")
+            if not do_file_write(dev, BLUETOOTH_BIN, "vol0:bluetooth.bin", CHUNK_STEP3):
+                return False
 
-        substep("3.7", "FirmwareUpdate type=1 path=vol0:core.bin (wait progress=100%)")
-        if not do_firmware_update_wait_progress(dev, target_id=1, path="vol0:core.bin"):
+        substep("3.6", "FirmwareUpdate type=2 path=vol0:bluetooth.bin (wait progress=100%)")
+        if not do_firmware_update_wait_progress(dev, target_id=2, path="vol0:bluetooth.bin"):
             return False
 
-        substep("3.8", f"Wait {STEP2_PRE_CONNECT_S}s, then connect device (timeout {STEP2_FINAL_CONNECT_TIMEOUT_S}s)")
+        substep("3.7", f"Wait {STEP3_POST_COMPLETE_WAIT_S}s, then enter step4")
         safe_close(dev)
         dev = None
-        log("INFO", f"Waiting {STEP2_PRE_CONNECT_S}s before final connect...")
-        time.sleep(STEP2_PRE_CONNECT_S)
-        dev = wait_connect(STEP2_FINAL_CONNECT_TIMEOUT_S, label="step3.connect-final")
+        log("INFO", f"Waiting {STEP3_POST_COMPLETE_WAIT_S}s before step4...")
+        time.sleep(STEP3_POST_COMPLETE_WAIT_S)
 
-        safe_close(dev)
-        dev = None
         log("OK", "Step3 finished.")
         return True
-    except WorkflowFatal:
-        raise  # bubble up so the workflow aborts immediately, no retry
     except Exception as e:
         log("FAIL", f"Step3 exception: {e}")
         return False
@@ -1017,17 +1029,12 @@ def run_step3_once(attempt_no: int) -> bool:
 
 
 def run_step3(max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> int:
-    stage("Workflow START - step3: update resources & firmware")
-    log("INFO", f"Assets dir    : {ASSETS_DIR}")
-    log("INFO", f"Firmware bin  : {FIRMWARE_BIN}")
-    log("INFO", f"Volume label  : \"{ONEKEY_VOLUME_LABEL}\"")
+    stage("Workflow START - step3: update bluetooth")
+    log("INFO", f"Bluetooth bin : {BLUETOOTH_BIN}")
     log("INFO", f"Max attempts  : {max_attempts}")
 
-    if not os.path.isdir(ASSETS_DIR):
-        log("FAIL", f"Required dir missing: {ASSETS_DIR}")
-        return 2
-    if not os.path.isfile(FIRMWARE_BIN):
-        log("FAIL", f"Required file missing: {FIRMWARE_BIN}")
+    if not os.path.isfile(BLUETOOTH_BIN):
+        log("FAIL", f"Required file missing: {BLUETOOTH_BIN}")
         return 2
 
     for i in range(1, max_attempts + 1):
@@ -1043,6 +1050,91 @@ def run_step3(max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> int:
     return 1
 
 
+# ==================== STEP 4 ====================
+
+def run_step4_once(attempt_no: int) -> bool:
+    stage(f"STEP4 attempt #{attempt_no} - update firmware")
+    dev: Optional[WebUsbDevice] = None
+    try:
+        substep("4.1", "Connect device (timeout 60s)")
+        dev = wait_connect(CONNECT_TIMEOUT_S, label="step4.connect-1")
+
+        substep("4.2", f"Reboot type=1, then wait {STEP4_POST_REBOOT_WAIT_S}s")
+        if not do_reboot(dev, reboot_type=1):
+            return False
+        safe_close(dev)
+        dev = None
+        time.sleep(STEP4_POST_REBOOT_WAIT_S)
+
+        substep("4.3", "Re-connect device (timeout 60s)")
+        dev = wait_connect(CONNECT_TIMEOUT_S, label="step4.connect-2")
+
+        substep("4.4", f"Ping device (timeout 60s), then wait {STEP4_POST_PING_WAIT_S}s")
+        if not do_ping(dev, PING_TIMEOUT_S, tag="step4"):
+            return False
+        log("INFO", f"Ping OK, waiting {STEP4_POST_PING_WAIT_S}s before next step...")
+        time.sleep(STEP4_POST_PING_WAIT_S)
+
+        substep("4.5", "Ensure vol0:core.bin exists (write bin/pro2_firmware_signed.bin if missing)")
+        info = do_path_info(dev, "vol0:core.bin")
+        if info is None:
+            raise WorkflowFatal("PathInfo query for vol0:core.bin failed; aborting workflow.")
+        if info["exist"]:
+            log("INFO", "vol0:core.bin already exists; skipping file_write")
+        else:
+            if not os.path.isfile(FIRMWARE_BIN):
+                raise WorkflowFatal(f"firmware bin missing on host: {FIRMWARE_BIN}")
+            log("INFO", f"vol0:core.bin missing; writing {FIRMWARE_BIN}")
+            if not do_file_write(dev, FIRMWARE_BIN, "vol0:core.bin", CHUNK_STEP1):
+                raise WorkflowFatal("Failed to write vol0:core.bin; aborting workflow.")
+
+        substep("4.6", "FirmwareUpdate type=1 path=vol0:core.bin (wait progress=100%, errors ignored)")
+        do_firmware_update_wait_progress(
+            dev, target_id=1, path="vol0:core.bin", ignore_errors=True,
+        )
+
+        substep("4.7", f"Wait {STEP4_PRE_CONNECT_S}s, then connect device (timeout {STEP4_FINAL_CONNECT_TIMEOUT_S}s)")
+        safe_close(dev)
+        dev = None
+        log("INFO", f"Waiting {STEP4_PRE_CONNECT_S}s before final connect...")
+        time.sleep(STEP4_PRE_CONNECT_S)
+        dev = wait_connect(STEP4_FINAL_CONNECT_TIMEOUT_S, label="step4.connect-final")
+
+        safe_close(dev)
+        dev = None
+        log("OK", "Step4 finished.")
+        return True
+    except WorkflowFatal:
+        raise
+    except Exception as e:
+        log("FAIL", f"Step4 exception: {e}")
+        return False
+    finally:
+        safe_close(dev)
+
+
+def run_step4(max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> int:
+    stage("Workflow START - step4: update firmware")
+    log("INFO", f"Firmware bin  : {FIRMWARE_BIN}")
+    log("INFO", f"Max attempts  : {max_attempts}")
+
+    if not os.path.isfile(FIRMWARE_BIN):
+        log("FAIL", f"Required file missing: {FIRMWARE_BIN}")
+        return 2
+
+    for i in range(1, max_attempts + 1):
+        if run_step4_once(i):
+            stage("STEP4 SUCCESS")
+            return 0
+        if i < max_attempts:
+            log("WARN", f"Step4 attempt #{i} failed; retrying from beginning...")
+        else:
+            log("WARN", f"Step4 attempt #{i} failed; no retries left.")
+        time.sleep(2.0)
+    stage("STEP4 FAILED")
+    return 1
+
+
 # ==================== CLI ====================
 
 def run_all(max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> int:
@@ -1055,6 +1147,9 @@ def run_all(max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> int:
     rc = run_step3(max_attempts)
     if rc != 0:
         return rc
+    rc = run_step4(max_attempts)
+    if rc != 0:
+        return rc
     stage("ALL STEPS FINISHED SUCCESSFULLY")
     return 0
 
@@ -1062,12 +1157,12 @@ def run_all(max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="workflow_step1",
-        description="OneKey Pro 2 update workflow runner (step1/step2/step3/all)",
+        description="OneKey Pro 2 update workflow runner (step1/step2/step3/step4/all)",
     )
     p.add_argument("target",
                    nargs="?",
                    default="all",
-                   choices=["all", "step1", "step2", "step3"],
+                   choices=["all", "step1", "step2", "step3", "step4"],
                    help="which part of the workflow to run (default: all)")
     p.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS,
                    help=f"max retries per step (default {DEFAULT_MAX_ATTEMPTS})")
@@ -1086,6 +1181,8 @@ def main() -> int:
             return run_step2(args.max_attempts)
         if args.target == "step3":
             return run_step3(args.max_attempts)
+        if args.target == "step4":
+            return run_step4(args.max_attempts)
     except WorkflowFatal as e:
         stage("WORKFLOW ABORTED")
         log("FAIL", str(e))
