@@ -217,6 +217,53 @@
             margin-bottom: 10px;
             font-weight: 600;
         }
+        .fw-notif-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 6px 0;
+            font-size: 14px;
+        }
+        .fw-notif-target {
+            min-width: 130px;
+            color: #ddd;
+            font-weight: 600;
+        }
+        .fw-progress-bar {
+            flex: 1;
+            height: 18px;
+            background: #333;
+            border-radius: 4px;
+            overflow: hidden;
+            position: relative;
+        }
+        .fw-progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #00d4aa, #00a080);
+            transition: width 0.2s ease;
+        }
+        .fw-progress-pct {
+            min-width: 48px;
+            text-align: right;
+            color: #00d4aa;
+            font-family: 'Monaco', 'Consolas', monospace;
+        }
+        .fw-progress-stage {
+            color: #888;
+            font-style: italic;
+            font-size: 12px;
+        }
+        .fw-status-badge {
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .fw-status-finished { background: #1d4d35; color: #6fd39b; }
+        .fw-status-in_progress { background: #3d4520; color: #d4c800; }
+        .fw-status-failed { background: #501a1a; color: #ff6666; }
+        .fw-status-unknown { background: #333; color: #aaa; }
         .status-entry-content {
             font-family: 'Monaco', 'Consolas', monospace;
             font-size: 13px;
@@ -284,7 +331,6 @@
             <button class="tab-btn" onclick="switchPbTab('pathinfo')">Path Info</button>
             <button class="tab-btn" onclick="switchPbTab('fwupdate')">FW Update</button>
             <button class="tab-btn" onclick="switchPbTab('reboot')">Reboot</button>
-            <button class="tab-btn" onclick="switchPbTab('syncfindmy')">Sync Findmy</button>
         </div>
 
         <div id="pb-tab-ping" class="tab-content active">
@@ -451,18 +497,6 @@
                 <div><span class="label">Result:</span> <span class="value" id="rebootResultText">-</span></div>
             </div>
         </div>
-
-        <div id="pb-tab-syncfindmy" class="tab-content">
-            <p style="color: #aaa; margin: 0 0 10px 0;">Trigger device to sync findmy token (no payload).</p>
-            <div class="flex" style="margin-top: 10px;">
-                <button onclick="sendSyncFindmyToken()" id="sendSyncFindmyBtn" disabled>📡 Sync Findmy Token</button>
-            </div>
-            <div class="pb-msg-info" id="syncFindmyResult" style="display: none; margin-top: 15px;">
-                <div><span class="label">TX msg_type:</span> <span class="value" id="syncFindmyTxType">-</span></div>
-                <div><span class="label">RX msg_type:</span> <span class="value" id="syncFindmyRxType">-</span></div>
-                <div><span class="label">Result:</span> <span class="value" id="syncFindmyResultText">-</span></div>
-            </div>
-        </div>
     </div>
 
         <div class="status-bar card">
@@ -474,6 +508,23 @@
                 </label>
             </div>
             <div id="statusBarContent" class="status-bar-content"></div>
+        </div>
+
+        <div class="card">
+            <div class="flex" style="justify-content: space-between; margin-bottom: 10px;">
+                <h3 style="margin: 0;">📡 Firmware Notifications</h3>
+                <button onclick="clearFwNotif()" style="background: #444; color: #ccc; font-size: 13px; padding: 6px 12px;">Clear</button>
+            </div>
+            <div style="margin-bottom: 15px;">
+                <div class="label" style="color: #aaa; margin-bottom: 8px;">FirmwareInstallProgress</div>
+                <div id="fwProgressEmpty" style="color: #666; font-size: 14px;">(waiting for progress...)</div>
+                <div id="fwProgressList" style="display: none;"></div>
+            </div>
+            <div>
+                <div class="label" style="color: #aaa; margin-bottom: 8px;">FirmwareUpdateStatus</div>
+                <div id="fwStatusEmpty" style="color: #666; font-size: 14px;">(waiting for status...)</div>
+                <div id="fwStatusList" style="display: none;"></div>
+            </div>
         </div>
 
         <div class="card">
@@ -505,6 +556,11 @@
         let rxBuffer = new Uint8Array(0);
         const rxWaiters = [];
         const rxUnsolicited = [];
+        // FIFO of raw USB chunks — reader enqueues, processor drains, so slow
+        // parse/dispatch handlers never delay the next transferIn call.
+        const rxRawQueue = [];
+        let rxProcessorRunning = false;
+        let rxProcessorWakeup = null;
 
         function rxAppend(newData) {
             const merged = new Uint8Array(rxBuffer.length + newData.length);
@@ -550,7 +606,96 @@
             return null;
         }
 
+        const FW_STATUS_NAME = { 0: 'finished', 1: 'in_progress', 2: 'failed' };
+        const fwProgressRows = {};
+        const fwStatusRows = {};
+
+        function fwTargetLabel(id) {
+            return FW_TARGET_NAME[id] || `id=${id}`;
+        }
+
+        function updateFwProgress(targetId, progress, stage) {
+            document.getElementById('fwProgressEmpty').style.display = 'none';
+            const listEl = document.getElementById('fwProgressList');
+            listEl.style.display = 'block';
+            let row = fwProgressRows[targetId];
+            if (!row) {
+                row = document.createElement('div');
+                row.className = 'fw-notif-row';
+                row.innerHTML =
+                    `<span class="fw-notif-target"></span>` +
+                    `<div class="fw-progress-bar"><div class="fw-progress-fill" style="width:0%"></div></div>` +
+                    `<span class="fw-progress-pct">0%</span>` +
+                    `<span class="fw-progress-stage"></span>`;
+                listEl.appendChild(row);
+                fwProgressRows[targetId] = row;
+            }
+            row.querySelector('.fw-notif-target').textContent = fwTargetLabel(targetId);
+            row.querySelector('.fw-progress-fill').style.width = `${Math.min(progress, 100)}%`;
+            row.querySelector('.fw-progress-pct').textContent = `${progress}%`;
+            row.querySelector('.fw-progress-stage').textContent = stage || '';
+        }
+
+        function updateFwStatus(targets) {
+            document.getElementById('fwStatusEmpty').style.display = 'none';
+            const listEl = document.getElementById('fwStatusList');
+            listEl.style.display = 'block';
+            for (const t of targets) {
+                let row = fwStatusRows[t.targetId];
+                if (!row) {
+                    row = document.createElement('div');
+                    row.className = 'fw-notif-row';
+                    row.innerHTML =
+                        `<span class="fw-notif-target"></span>` +
+                        `<span class="fw-status-badge"></span>`;
+                    listEl.appendChild(row);
+                    fwStatusRows[t.targetId] = row;
+                }
+                const statusName = FW_STATUS_NAME[t.status] || 'unknown';
+                row.querySelector('.fw-notif-target').textContent = fwTargetLabel(t.targetId);
+                const badge = row.querySelector('.fw-status-badge');
+                badge.textContent = statusName;
+                badge.className = `fw-status-badge fw-status-${statusName}`;
+            }
+        }
+
+        function clearFwNotif() {
+            for (const k of Object.keys(fwProgressRows)) delete fwProgressRows[k];
+            for (const k of Object.keys(fwStatusRows)) delete fwStatusRows[k];
+            const progList = document.getElementById('fwProgressList');
+            const statList = document.getElementById('fwStatusList');
+            progList.innerHTML = '';
+            statList.innerHTML = '';
+            progList.style.display = 'none';
+            statList.style.display = 'none';
+            document.getElementById('fwProgressEmpty').style.display = 'block';
+            document.getElementById('fwStatusEmpty').style.display = 'block';
+        }
+
+        function handleFirmwareNotification(msg) {
+            if (msg.msgType === PB_MSG_TYPE.FirmwareInstallProgress) {
+                const p = pbDecoder.decodeFirmwareInstallProgress(msg.pbPayload);
+                updateFwProgress(p.targetId, p.progress, p.stage);
+                const stage = p.stage ? ` [${p.stage}]` : '';
+                log(`📈 [FirmwareInstallProgress] ${fwTargetLabel(p.targetId)}: ${p.progress}%${stage}`, 'info');
+                return true;
+            }
+            if (msg.msgType === PB_MSG_TYPE.FirmwareUpdateStatus) {
+                const s = pbDecoder.decodeFirmwareUpdateStatus(msg.pbPayload);
+                updateFwStatus(s.targets);
+                const summary = s.targets.map(t =>
+                    `${fwTargetLabel(t.targetId)}=${FW_STATUS_NAME[t.status] || t.status}`
+                ).join(', ');
+                log(`📋 [FirmwareUpdateStatus] ${summary || '(empty)'}`, 'info');
+                return true;
+            }
+            return false;
+        }
+
         function rxDispatch(msg) {
+            if (handleFirmwareNotification(msg)) {
+                return;
+            }
             if (rxWaiters.length > 0) {
                 const waiter = rxWaiters.shift();
                 waiter.resolve(msg);
@@ -563,6 +708,19 @@
 
         let rxDebug = true;
 
+        function rxWakeProcessor() {
+            if (rxProcessorWakeup) {
+                const w = rxProcessorWakeup;
+                rxProcessorWakeup = null;
+                w();
+            }
+        }
+
+        function rxWaitForData() {
+            if (rxRawQueue.length > 0 || !rxProcessorRunning) return Promise.resolve();
+            return new Promise(resolve => { rxProcessorWakeup = resolve; });
+        }
+
         async function rxLoop() {
             rxLoopRunning = true;
             log('[RX] background reader started', 'info');
@@ -574,20 +732,9 @@
                         continue;
                     }
                     const raw = new Uint8Array(result.data.buffer);
-                    if (rxDebug) {
-                        const hex = Array.from(raw.slice(0, 32)).map(b => b.toString(16).padStart(2, '0')).join(' ');
-                        log(`[RX] IN ${raw.length}B: ${hex}${raw.length > 32 ? '...' : ''} | buf=${rxBuffer.length} waiters=${rxWaiters.length}`, 'rx');
-                    }
-                    rxAppend(raw);
-                    let msg;
-                    while ((msg = rxTryParseFrame()) !== null) {
-                        const name = PB_MSG_NAME[msg.msgType] || msg.msgType;
-                        if (rxDebug) log(`[RX] frame: ${name} payload=${msg.pbPayload.length}B | waiters=${rxWaiters.length}`, 'rx');
-                        rxDispatch(msg);
-                    }
-                    if (rxBuffer.length > 0 && rxDebug) {
-                        log(`[RX] pending buf=${rxBuffer.length}B (incomplete frame)`, 'info');
-                    }
+                    rxRawQueue.push(raw);
+                    if (rxDebug) log(`[RX] enq ${raw.length}B q=${rxRawQueue.length}`, 'rx');
+                    rxWakeProcessor();
                 } catch (e) {
                     if (!rxLoopRunning || !device) break;
                     log(`[RX] read error: ${e.message}`, 'error');
@@ -597,13 +744,65 @@
             log('[RX] background reader stopped', 'info');
         }
 
+        async function rxProcessLoop() {
+            rxProcessorRunning = true;
+            log('[RX] processor started', 'info');
+            while (rxProcessorRunning) {
+                if (rxRawQueue.length === 0) {
+                    await rxWaitForData();
+                    if (!rxProcessorRunning) break;
+                    continue;
+                }
+                const raw = rxRawQueue.shift();
+                if (rxDebug) {
+                    const hex = Array.from(raw.slice(0, 32)).map(b => b.toString(16).padStart(2, '0')).join(' ');
+                    log(`[RX] IN ${raw.length}B: ${hex}${raw.length > 32 ? '...' : ''} | buf=${rxBuffer.length} waiters=${rxWaiters.length} q=${rxRawQueue.length}`, 'rx');
+                }
+                rxAppend(raw);
+                // Drain all glued protocol frames from rxBuffer. A parse or
+                // handler exception on one frame must NOT halt the drain, or
+                // the remaining frames stay stuck in rxBuffer and look lost.
+                let framesDispatched = 0;
+                while (true) {
+                    let msg;
+                    try {
+                        msg = rxTryParseFrame();
+                    } catch (e) {
+                        log(`[RX] parse error: ${e.message}`, 'error');
+                        console.error(e);
+                        break;
+                    }
+                    if (msg === null) break;
+                    framesDispatched++;
+                    const name = PB_MSG_NAME[msg.msgType] || msg.msgType;
+                    if (rxDebug) log(`[RX] frame #${framesDispatched}: ${name} payload=${msg.pbPayload.length}B | buf=${rxBuffer.length} waiters=${rxWaiters.length}`, 'rx');
+                    try {
+                        rxDispatch(msg);
+                    } catch (e) {
+                        log(`[RX] dispatch error (${name}): ${e.message}`, 'error');
+                        console.error(e);
+                    }
+                }
+                if (rxDebug && framesDispatched > 1) {
+                    log(`[RX] unpacked ${framesDispatched} glued frames from chunk`, 'info');
+                }
+                if (rxBuffer.length > 0 && rxDebug) {
+                    log(`[RX] pending buf=${rxBuffer.length}B (incomplete frame)`, 'info');
+                }
+            }
+            log('[RX] processor stopped', 'info');
+        }
+
         function rxStop() {
             rxLoopRunning = false;
+            rxProcessorRunning = false;
+            rxWakeProcessor();
             while (rxWaiters.length > 0) {
                 rxWaiters.shift().reject(new Error('Disconnected'));
             }
             rxBuffer = new Uint8Array(0);
             rxUnsolicited.length = 0;
+            rxRawQueue.length = 0;
         }
 
         function waitForResponse(timeout = 5000) {
@@ -679,7 +878,6 @@
             const sendPathInfoBtn = document.getElementById('sendPathInfoBtn');
             const sendFwUpdateBtn = document.getElementById('sendFwUpdateBtn');
             const sendRebootBtn = document.getElementById('sendRebootBtn');
-            const sendSyncFindmyBtn = document.getElementById('sendSyncFindmyBtn');
             const startFwTestBtn = document.getElementById('startFwTestBtn');
 
             if (connected) {
@@ -692,7 +890,6 @@
                 if (sendPathInfoBtn) sendPathInfoBtn.disabled = false;
                 if (sendFwUpdateBtn) sendFwUpdateBtn.disabled = false;
                 if (sendRebootBtn) sendRebootBtn.disabled = false;
-                if (sendSyncFindmyBtn) sendSyncFindmyBtn.disabled = false;
                 if (startFwTestBtn && !fwTestRunning) startFwTestBtn.disabled = false;
             } else {
                 status.textContent = 'Disconnected';
@@ -704,7 +901,6 @@
                 if (sendPathInfoBtn) sendPathInfoBtn.disabled = true;
                 if (sendFwUpdateBtn) sendFwUpdateBtn.disabled = true;
                 if (sendRebootBtn) sendRebootBtn.disabled = true;
-                if (sendSyncFindmyBtn) sendSyncFindmyBtn.disabled = true;
                 if (startFwTestBtn) startFwTestBtn.disabled = true;
             }
         }
@@ -758,6 +954,7 @@
                 log('✅ Connected successfully!', 'info');
 
                 rxLoop();
+                rxProcessLoop();
 
             } catch (error) {
                 log(`❌ Connection error: ${error.message}`, 'error');
@@ -878,7 +1075,6 @@
             Success: 60207,
             Failure: 60208,
             Reboot: 60400,
-            SyncFindmyToken: 60700,
             FixPermission: 60800,
             PathInfo: 60801,
             PathInfoQuery: 60802,
@@ -892,6 +1088,8 @@
             DirRemove: 60810,
             FirmwareUpdate: 61000,
             FirmwareInstallProgress: 61001,
+            GetFirmwareUpdateStatus: 61002,
+            FirmwareUpdateStatus: 61003,
         };
 
         const PB_MSG_NAME = Object.fromEntries(Object.entries(PB_MSG_TYPE).map(([k, v]) => [v, k]));
@@ -1059,11 +1257,6 @@
             encodeReboot(rebootType) {
                 return new Uint8Array(this.encodeUint32(1, rebootType, true));
             },
-
-            // SyncFindmyToken { }
-            encodeSyncFindmyToken() {
-                return new Uint8Array([]);
-            },
         };
 
         const pbDecoder = {
@@ -1187,6 +1380,74 @@
                     }
                 }
                 return result;
+            },
+
+            // FirmwareInstallProgress { required FirmwareTargetType target_id=1; required uint32 progress=2; optional string stage=3; }
+            decodeFirmwareInstallProgress(data) {
+                let offset = 0;
+                const result = { targetId: 0, progress: 0, stage: '' };
+                while (offset < data.length) {
+                    const { value: tag, offset: off1 } = this.decodeVarint(data, offset);
+                    offset = off1;
+                    const fieldNum = tag >> 3;
+                    const wireType = tag & 0x7;
+                    if (wireType === 0) {
+                        const { value: val, offset: off2 } = this.decodeVarint(data, offset);
+                        offset = off2;
+                        if (fieldNum === 1) result.targetId = val;
+                        else if (fieldNum === 2) result.progress = val;
+                    } else if (wireType === 2) {
+                        const { value: len, offset: off2 } = this.decodeVarint(data, offset);
+                        const str = this.decodeString(data, off2, len);
+                        if (fieldNum === 3) result.stage = str;
+                        offset = off2 + len;
+                    } else {
+                        break;
+                    }
+                }
+                return result;
+            },
+
+            // FirmwareUpdateStatus { repeated FirmwareUpdateStatusEntry targets=1; }
+            // FirmwareUpdateStatusEntry { required FirmwareTargetType target_id=1; required uint32 status=2; }
+            decodeFirmwareUpdateStatus(data) {
+                let offset = 0;
+                const result = { targets: [] };
+                while (offset < data.length) {
+                    const { value: tag, offset: off1 } = this.decodeVarint(data, offset);
+                    offset = off1;
+                    const fieldNum = tag >> 3;
+                    const wireType = tag & 0x7;
+                    if (wireType === 2 && fieldNum === 1) {
+                        const { value: len, offset: off2 } = this.decodeVarint(data, offset);
+                        const entryBytes = data.slice(off2, off2 + len);
+                        result.targets.push(this.decodeFirmwareUpdateStatusEntry(entryBytes));
+                        offset = off2 + len;
+                    } else {
+                        break;
+                    }
+                }
+                return result;
+            },
+
+            decodeFirmwareUpdateStatusEntry(data) {
+                let offset = 0;
+                const entry = { targetId: 0, status: 0 };
+                while (offset < data.length) {
+                    const { value: tag, offset: off1 } = this.decodeVarint(data, offset);
+                    offset = off1;
+                    const fieldNum = tag >> 3;
+                    const wireType = tag & 0x7;
+                    if (wireType === 0) {
+                        const { value: val, offset: off2 } = this.decodeVarint(data, offset);
+                        offset = off2;
+                        if (fieldNum === 1) entry.targetId = val;
+                        else if (fieldNum === 2) entry.status = val;
+                    } else {
+                        break;
+                    }
+                }
+                return entry;
             },
 
             // Dir { required string path=1; optional string child_dirs=2; optional string child_files=3; }
@@ -1897,49 +2158,6 @@
                 addStatusEntry('Reboot', {
                     'type': REBOOT_TYPE_NAME[rebootType] || rebootType
                 }, `Error: ${error.message}`, -1);
-            }
-        }
-
-        async function sendSyncFindmyToken() {
-            if (!device) {
-                log('Not connected!', 'error');
-                return;
-            }
-
-            const infoDiv = document.getElementById('syncFindmyResult');
-            infoDiv.style.display = 'block';
-            document.getElementById('syncFindmyTxType').textContent = `${PB_MSG_TYPE.SyncFindmyToken} (SyncFindmyToken)`;
-            document.getElementById('syncFindmyRxType').textContent = 'waiting...';
-            document.getElementById('syncFindmyResultText').textContent = '-';
-
-            log(`📡 [SyncFindmyToken] Triggering token sync`, 'info');
-
-            try {
-                const pbPayload = pbEncoder.encodeSyncFindmyToken();
-                const resp = await sendPbMessage(PB_MSG_TYPE.SyncFindmyToken, pbPayload);
-
-                document.getElementById('syncFindmyRxType').textContent = `${resp.msgType} (${PB_MSG_NAME[resp.msgType] || 'Unknown'})`;
-
-                if (resp.msgType === PB_MSG_TYPE.Success) {
-                    const decoded = pbDecoder.decodeSuccess(resp.pbPayload);
-                    document.getElementById('syncFindmyResultText').textContent = `Success: "${decoded.message}"`;
-                    log(`✅ [SyncFindmyToken] Success: "${decoded.message}"`, 'info');
-                    addStatusEntry('SyncFindmyToken', { 'rx_msg_type': `${resp.msgType}` }, 'Success', 0);
-                } else if (resp.msgType === PB_MSG_TYPE.Failure) {
-                    const failure = pbDecoder.decodeFailure(resp.pbPayload);
-                    document.getElementById('syncFindmyResultText').textContent = `Failure: code=${failure.code}, "${failure.message}"`;
-                    log(`❌ [SyncFindmyToken] Failure: code=${failure.code}, "${failure.message}"`, 'error');
-                    addStatusEntry('SyncFindmyToken', { 'rx_msg_type': `${resp.msgType}` }, `Failure: "${failure.message}"`, failure.code);
-                } else {
-                    document.getElementById('syncFindmyResultText').textContent = `Unexpected response type: ${resp.msgType}`;
-                    log(`❌ [SyncFindmyToken] Unexpected response type: ${resp.msgType}`, 'error');
-                    addStatusEntry('SyncFindmyToken', { 'rx_msg_type': `${resp.msgType}` }, `Unexpected response type: ${resp.msgType}`, -1);
-                }
-            } catch (error) {
-                log(`❌ [SyncFindmyToken] Error: ${error.message}`, 'error');
-                document.getElementById('syncFindmyRxType').textContent = 'error';
-                document.getElementById('syncFindmyResultText').textContent = `Error: ${error.message}`;
-                addStatusEntry('SyncFindmyToken', {}, `Error: ${error.message}`, -1);
             }
         }
     </script>

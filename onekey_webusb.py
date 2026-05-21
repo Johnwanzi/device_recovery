@@ -1,17 +1,20 @@
 """
 OneKey Pro 2 WebUSB Upgrade Tool (Python)
 
-Implements: ping, reboot, file_write, file_delete, fw_update, path_info, listen
+Implements: ping, reboot, file_write, file_delete, fw_update, fw_status,
+            path_info, listen
 
-fw_update will also print FirmwareInstallProgress (msg 61001) frames the device
-pushes during installation. `listen` is a standalone subcommand that only prints
-incoming FirmwareInstallProgress frames.
+fw_update prints FirmwareInstallProgress (msg 61001) frames the device pushes
+during installation, plus any FirmwareUpdateStatus (msg 61003) frames.
+`listen` is a standalone subcommand that prints incoming FirmwareInstallProgress
+and FirmwareUpdateStatus frames.
 
 Usage examples:
     python onekey_webusb.py ping --message "hello"
     python onekey_webusb.py reboot --type 0
     python onekey_webusb.py file_write --src ./firmware.bin --dst vol1:firmware.bin
     python onekey_webusb.py fw_update --target 0 --path vol1:firmware.bin --reboot
+    python onekey_webusb.py fw_status
     python onekey_webusb.py path_info --path vol1:firmware.bin
     python onekey_webusb.py file_delete --path vol1:firmware.bin
     python onekey_webusb.py listen --duration 60
@@ -71,6 +74,8 @@ PB_MSG_TYPE = {
     "DirRemove": 60810,
     "FirmwareUpdate": 61000,
     "FirmwareInstallProgress": 61001,
+    "GetFirmwareUpdateStatus": 61002,
+    "FirmwareUpdateStatus": 61003,
 }
 PB_MSG_NAME = {v: k for k, v in PB_MSG_TYPE.items()}
 
@@ -87,6 +92,9 @@ FW_TARGET_NAME = {
 }
 
 REBOOT_TYPE_NAME = {0: "Normal", 1: "Boardloader", 2: "BootLoader"}
+
+# FirmwareUpdateStatusEntry.status enum (matches webusb_upgrade_0330.html FW_STATUS_NAME).
+FW_STATUS_NAME = {0: "finished", 1: "in_progress", 2: "failed"}
 
 
 CRC8_TABLE = bytes([
@@ -227,6 +235,11 @@ def encode_firmware_update(targets, reboot_on_success: Optional[bool] = None) ->
     return bytes(out)
 
 
+def encode_get_firmware_update_status() -> bytes:
+    """GetFirmwareUpdateStatus has no fields; the body is empty."""
+    return b""
+
+
 def decode_success(data: bytes) -> dict:
     offset = 0
     message = ""
@@ -311,6 +324,43 @@ def decode_firmware_install_progress(data: bytes) -> dict:
             length, offset = decode_varint(data, offset)
             if field == 3:
                 result["stage"] = data[offset:offset + length].decode("utf-8", errors="replace")
+            offset += length
+        else:
+            break
+    return result
+
+
+def decode_firmware_update_status_entry(data: bytes) -> dict:
+    """FirmwareUpdateStatusEntry { required FirmwareTargetType target_id=1; required uint32 status=2; }"""
+    offset = 0
+    entry = {"target_id": 0, "status": 0}
+    while offset < len(data):
+        tag, offset = decode_varint(data, offset)
+        field = tag >> 3
+        wire = tag & 0x7
+        if wire == 0:
+            val, offset = decode_varint(data, offset)
+            if field == 1:
+                entry["target_id"] = val
+            elif field == 2:
+                entry["status"] = val
+        else:
+            break
+    return entry
+
+
+def decode_firmware_update_status(data: bytes) -> dict:
+    """FirmwareUpdateStatus { repeated FirmwareUpdateStatusEntry targets=1; }"""
+    offset = 0
+    result = {"targets": []}
+    while offset < len(data):
+        tag, offset = decode_varint(data, offset)
+        field = tag >> 3
+        wire = tag & 0x7
+        if wire == 2 and field == 1:
+            length, offset = decode_varint(data, offset)
+            entry_bytes = data[offset:offset + length]
+            result["targets"].append(decode_firmware_update_status_entry(entry_bytes))
             offset += length
         else:
             break
@@ -761,6 +811,17 @@ def _print_progress(msg_type: int, pb_payload: bytes) -> None:
         target_label = FW_TARGET_NAME.get(p["target_id"], str(p["target_id"]))
         stage = f" [{p['stage']}]" if p["stage"] else ""
         print(f"[>] FirmwareInstallProgress: {target_label}: {p['progress']}%{stage}")
+    elif msg_type == PB_MSG_TYPE["FirmwareUpdateStatus"]:
+        s = decode_firmware_update_status(pb_payload)
+        if not s["targets"]:
+            print("[>] FirmwareUpdateStatus: (empty)")
+        else:
+            summary = ", ".join(
+                f"{FW_TARGET_NAME.get(t['target_id'], t['target_id'])}="
+                f"{FW_STATUS_NAME.get(t['status'], t['status'])}"
+                for t in s["targets"]
+            )
+            print(f"[>] FirmwareUpdateStatus: {summary}")
     else:
         print(f"[RX] unsolicited msg_type={msg_type} ({PB_MSG_NAME.get(msg_type, 'Unknown')})")
 
@@ -796,9 +857,45 @@ def cmd_fw_update(dev: WebUsbDevice, args) -> int:
     return handle_resp_simple("FirmwareUpdate", resp)
 
 
+def cmd_fw_status(dev: WebUsbDevice, args) -> int:
+    """Send GetFirmwareUpdateStatus and print the FirmwareUpdateStatus reply."""
+    payload = encode_get_firmware_update_status()
+    print("[*] GetFirmwareUpdateStatus")
+    try:
+        resp_type, resp_payload = dev.send_and_recv(
+            PB_MSG_TYPE["GetFirmwareUpdateStatus"], payload,
+            timeout_ms=args.timeout * 1000,
+            expected_reply_types={
+                PB_MSG_TYPE["FirmwareUpdateStatus"],
+                PB_MSG_TYPE["Failure"],
+            },
+        )
+    except TimeoutError:
+        print("[-] FirmwareUpdateStatus timeout (no reply).")
+        return 1
+
+    if resp_type == PB_MSG_TYPE["FirmwareUpdateStatus"]:
+        s = decode_firmware_update_status(resp_payload)
+        if not s["targets"]:
+            print("[+] FirmwareUpdateStatus: (no targets reported)")
+            return 0
+        print(f"[+] FirmwareUpdateStatus: {len(s['targets'])} target(s)")
+        for t in s["targets"]:
+            target_label = FW_TARGET_NAME.get(t["target_id"], str(t["target_id"]))
+            status_label = FW_STATUS_NAME.get(t["status"], f"unknown({t['status']})")
+            print(f"    {target_label:<16}  status={status_label}  (target_id={t['target_id']}, code={t['status']})")
+        return 0
+    if resp_type == PB_MSG_TYPE["Failure"]:
+        decoded = decode_failure(resp_payload)
+        print(f"[-] GetFirmwareUpdateStatus Failure: code={decoded['code']}, msg=\"{decoded['message']}\"")
+        return decoded["code"] or 1
+    print(f"[-] GetFirmwareUpdateStatus Unexpected response: msg_type={resp_type}")
+    return 1
+
+
 def cmd_listen_progress(dev: WebUsbDevice, args) -> int:
-    """Passively listen for FirmwareInstallProgress (and other unsolicited) frames."""
-    print(f"[*] Listening for FirmwareInstallProgress for {args.duration}s (Ctrl-C to stop)...")
+    """Passively listen for FirmwareInstallProgress / FirmwareUpdateStatus (and other unsolicited) frames."""
+    print(f"[*] Listening for FirmwareInstallProgress/FirmwareUpdateStatus for {args.duration}s (Ctrl-C to stop)...")
     dev.on_unsolicited = _print_progress
     end = time.monotonic() + args.duration
     try:
@@ -854,7 +951,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--path", "-p", required=True, help="device path, e.g. vol1:firmware.bin")
     sp.set_defaults(func=cmd_file_delete)
 
-    sp = sub.add_parser("listen", help="Passively listen for FirmwareInstallProgress frames")
+    sp = sub.add_parser("fw_status", help="Query FirmwareUpdateStatus from device")
+    sp.add_argument("--timeout", type=int, default=5,
+                    help="response timeout in seconds (default 5)")
+    sp.set_defaults(func=cmd_fw_status)
+
+    sp = sub.add_parser("listen", help="Passively listen for FirmwareInstallProgress / FirmwareUpdateStatus frames")
     sp.add_argument("--duration", "-d", type=int, default=120,
                     help="listen duration in seconds (default 120)")
     sp.set_defaults(func=cmd_listen_progress)
