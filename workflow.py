@@ -366,6 +366,87 @@ def do_file_write(dev: WebUsbDevice, src_path: str, dst_path: str,
         return False
 
 
+def do_firmware_update_either(dev: WebUsbDevice, target_id: int, path: str,
+                              timeout_s: int = 120) -> bool:
+    """Send FirmwareUpdate and accept EITHER a Success reply OR FirmwareInstallProgress=100%.
+
+    Both conditions count as success (OR semantics). The first one to occur wins.
+    Failure reply is treated as failure. Used by step1.6.
+    """
+    target_label = FW_TARGET_NAME.get(target_id, str(target_id))
+    log("INFO", f"FirmwareUpdate target={target_id} ({target_label}) path={path}")
+    log("INFO", "  success criterion: FirmwareUpdate reply=Success  OR  FirmwareInstallProgress=100%")
+    state = {
+        "done_ok": False,        # set when either success path fires
+        "done_reason": "",
+        "fail_msg": "",          # set when a Failure reply arrives
+        "last_progress": -1,
+    }
+
+    def _on_any(mt: int, payload: bytes) -> None:
+        if state["done_ok"]:
+            return
+        if mt == PB_MSG_TYPE["FirmwareInstallProgress"]:
+            p = decode_firmware_install_progress(payload)
+            if p["progress"] != state["last_progress"]:
+                stage_str = f" [{p['stage']}]" if p["stage"] else ""
+                tag = FW_TARGET_NAME.get(p["target_id"], p["target_id"])
+                log("PROG", f"FirmwareInstallProgress  {tag}: {p['progress']}%{stage_str}")
+                state["last_progress"] = p["progress"]
+            if p["progress"] >= 100:
+                state["done_ok"] = True
+                state["done_reason"] = "FirmwareInstallProgress reached 100%"
+        elif mt == PB_MSG_TYPE["Success"]:
+            decoded = decode_success(payload)
+            state["done_ok"] = True
+            state["done_reason"] = f"FirmwareUpdate reply = Success (\"{decoded['message']}\")"
+        elif mt == PB_MSG_TYPE["Failure"]:
+            decoded = decode_failure(payload)
+            state["fail_msg"] = f"code={decoded['code']} msg=\"{decoded['message']}\""
+        else:
+            log("INFO", f"  (ignored) unsolicited msg_type={mt} ({PB_MSG_NAME.get(mt,'?')})")
+
+    dev.on_unsolicited = _on_any
+    try:
+        # Dispatch FirmwareUpdate by sending the frame directly — we route everything
+        # (reply + progress) through the same callback so either side can win the race.
+        from onekey_webusb import build_pb_frame
+        pb_payload = encode_firmware_update(
+            [{"target_id": target_id, "path": path}],
+            reboot_on_success=False,
+        )
+        frame = build_pb_frame(dev.framer, PB_MSG_TYPE["FirmwareUpdate"], pb_payload)
+        dev.dev.write(dev.ep_out.bEndpointAddress, frame, timeout=5000)
+        log("INFO", "  FirmwareUpdate request dispatched; waiting for reply=Success or progress=100%...")
+
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            try:
+                dev.drain_unsolicited(500)
+            except Exception:
+                if state["done_ok"]:
+                    pass  # device tearing down after success
+                else:
+                    raise
+            if state["done_ok"]:
+                log("OK", f"{target_label} update step SUCCESS  ({state['done_reason']})")
+                return True
+            if state["fail_msg"]:
+                log("FAIL", f"FirmwareUpdate failure: {state['fail_msg']}")
+                return False
+        log("FAIL", f"FirmwareUpdate timed out after {timeout_s}s "
+                   f"(last progress={state['last_progress']}%) -> step FAILED")
+        return False
+    except Exception as e:
+        if state["done_ok"]:
+            log("OK", f"{target_label} update step SUCCESS  ({state['done_reason']})")
+            return True
+        log("FAIL", f"FirmwareUpdate exception: {e}")
+        return False
+    finally:
+        dev.on_unsolicited = None
+
+
 def do_firmware_update_check(dev: WebUsbDevice, target_id: int, path: str,
                              reboot_on_success: bool = False,
                              timeout_s: int = 120) -> bool:
@@ -724,8 +805,8 @@ def run_step1_once(attempt_no: int) -> bool:
         if not do_file_write(dev, UPDATE_ROM_BIN, "vol0:update_rom.bin", CHUNK_STEP1):
             return False
 
-        substep("1.6", "FirmwareUpdate type=1 path=vol0:update_rom.bin (wait progress=100%)")
-        if not do_firmware_update_wait_progress(dev, target_id=1, path="vol0:update_rom.bin"):
+        substep("1.6", "FirmwareUpdate type=1 path=vol0:update_rom.bin (reply=Success OR progress=100%)")
+        if not do_firmware_update_either(dev, target_id=1, path="vol0:update_rom.bin", timeout_s=120):
             return False
 
         substep("1.7", f"Reboot type=0, then wait {STEP1_POST_REBOOT_S}s")
