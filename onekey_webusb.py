@@ -2,7 +2,7 @@
 OneKey Pro 2 WebUSB Upgrade Tool (Python)
 
 Implements: ping, reboot, file_write, file_delete, fw_update, fw_status,
-            path_info, listen
+            path_info, disk_control, listen
 
 fw_update prints FirmwareInstallProgress (msg 61001) frames the device pushes
 during installation, plus any FirmwareUpdateStatus (msg 61003) frames.
@@ -17,6 +17,7 @@ Usage examples:
     python onekey_webusb.py fw_status
     python onekey_webusb.py path_info --path vol1:firmware.bin
     python onekey_webusb.py file_delete --path vol1:firmware.bin
+    python onekey_webusb.py disk_control --enable 1   # 1 = enable MSC, 0 = disable
     python onekey_webusb.py listen --duration 60
 """
 
@@ -72,6 +73,7 @@ PB_MSG_TYPE = {
     "DirList": 60808,
     "DirMake": 60809,
     "DirRemove": 60810,
+    "FilesystemDiskControl": 60812,
     "FirmwareUpdate": 61000,
     "FirmwareInstallProgress": 61001,
     "GetFirmwareUpdateStatus": 61002,
@@ -95,6 +97,9 @@ REBOOT_TYPE_NAME = {0: "Normal", 1: "Boardloader", 2: "BootLoader"}
 
 # FirmwareUpdateStatusEntry.status enum (matches webusb_upgrade_0330.html FW_STATUS_NAME).
 FW_STATUS_NAME = {0: "finished", 1: "in_progress", 2: "failed"}
+
+# FilesystemDiskControl.enable values (mirrors DISK_CTRL_NAME in webusb_upgrade_0330.html).
+DISK_CTRL_NAME = {0: "Disable MSC", 1: "Enable MSC"}
 
 
 CRC8_TABLE = bytes([
@@ -216,6 +221,11 @@ def encode_file_delete(path: str) -> bytes:
 
 def encode_reboot(reboot_type: int) -> bytes:
     return pb_encode_uint32(1, reboot_type, required=True)
+
+
+def encode_disk_control(enable: int) -> bytes:
+    """FilesystemDiskControl { required uint32 enable = 1; }  (0=disable MSC, 1=enable MSC)"""
+    return pb_encode_uint32(1, enable, required=True)
 
 
 def encode_firmware_target(target_id: int, path: str) -> bytes:
@@ -893,6 +903,16 @@ def cmd_fw_status(dev: WebUsbDevice, args) -> int:
     return 1
 
 
+def cmd_disk_control(dev: WebUsbDevice, args) -> int:
+    payload = encode_disk_control(args.enable)
+    label = DISK_CTRL_NAME.get(args.enable, str(args.enable))
+    print(f"[*] FilesystemDiskControl -> enable={args.enable} ({label})")
+    resp = dev.send_and_recv(
+        PB_MSG_TYPE["FilesystemDiskControl"], payload, timeout_ms=DEFAULT_TIMEOUT_MS,
+    )
+    return handle_resp_simple("FilesystemDiskControl", resp)
+
+
 def cmd_listen_progress(dev: WebUsbDevice, args) -> int:
     """Passively listen for FirmwareInstallProgress / FirmwareUpdateStatus (and other unsolicited) frames."""
     print(f"[*] Listening for FirmwareInstallProgress/FirmwareUpdateStatus for {args.duration}s (Ctrl-C to stop)...")
@@ -955,6 +975,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--timeout", type=int, default=5,
                     help="response timeout in seconds (default 5)")
     sp.set_defaults(func=cmd_fw_status)
+
+    sp = sub.add_parser("disk_control", help="Enable/disable MSC (FilesystemDiskControl)")
+    sp.add_argument("--enable", "-e", type=int, required=True, choices=[0, 1],
+                    help="0=Disable MSC, 1=Enable MSC")
+    sp.set_defaults(func=cmd_disk_control)
 
     sp = sub.add_parser("listen", help="Passively listen for FirmwareInstallProgress / FirmwareUpdateStatus frames")
     sp.add_argument("--duration", "-d", type=int, default=120,

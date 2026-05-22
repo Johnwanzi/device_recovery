@@ -330,6 +330,7 @@
             <button class="tab-btn" onclick="switchPbTab('filewritetest')">File Write Test</button>
             <button class="tab-btn" onclick="switchPbTab('pathinfo')">Path Info</button>
             <button class="tab-btn" onclick="switchPbTab('fwupdate')">FW Update</button>
+            <button class="tab-btn" onclick="switchPbTab('diskctrl')">Disk Control</button>
             <button class="tab-btn" onclick="switchPbTab('reboot')">Reboot</button>
         </div>
 
@@ -478,6 +479,22 @@
                 <div><span class="label">TX msg_type:</span> <span class="value" id="fwUpdateTxType">-</span></div>
                 <div><span class="label">RX msg_type:</span> <span class="value" id="fwUpdateRxType">-</span></div>
                 <div><span class="label">Result:</span> <span class="value" id="fwUpdateResultText">-</span></div>
+            </div>
+        </div>
+
+        <div id="pb-tab-diskctrl" class="tab-content">
+            <label>MSC Control:</label>
+            <select id="diskCtrlEnable" style="margin-bottom: 10px;">
+                <option value="0">Disable MSC</option>
+                <option value="1">Enable MSC</option>
+            </select>
+            <div class="flex" style="margin-top: 10px;">
+                <button onclick="sendDiskControl()" id="sendDiskCtrlBtn" disabled>💾 Send Disk Control</button>
+            </div>
+            <div class="pb-msg-info" id="diskCtrlResult" style="display: none; margin-top: 15px;">
+                <div><span class="label">TX msg_type:</span> <span class="value" id="diskCtrlTxType">-</span></div>
+                <div><span class="label">RX msg_type:</span> <span class="value" id="diskCtrlRxType">-</span></div>
+                <div><span class="label">Result:</span> <span class="value" id="diskCtrlResultText">-</span></div>
             </div>
         </div>
 
@@ -879,6 +896,7 @@
             const sendFwUpdateBtn = document.getElementById('sendFwUpdateBtn');
             const sendRebootBtn = document.getElementById('sendRebootBtn');
             const startFwTestBtn = document.getElementById('startFwTestBtn');
+            const sendDiskCtrlBtn = document.getElementById('sendDiskCtrlBtn');
 
             if (connected) {
                 status.textContent = 'Connected';
@@ -891,6 +909,7 @@
                 if (sendFwUpdateBtn) sendFwUpdateBtn.disabled = false;
                 if (sendRebootBtn) sendRebootBtn.disabled = false;
                 if (startFwTestBtn && !fwTestRunning) startFwTestBtn.disabled = false;
+                if (sendDiskCtrlBtn) sendDiskCtrlBtn.disabled = false;
             } else {
                 status.textContent = 'Disconnected';
                 status.className = 'status disconnected';
@@ -902,6 +921,7 @@
                 if (sendFwUpdateBtn) sendFwUpdateBtn.disabled = true;
                 if (sendRebootBtn) sendRebootBtn.disabled = true;
                 if (startFwTestBtn) startFwTestBtn.disabled = true;
+                if (sendDiskCtrlBtn) sendDiskCtrlBtn.disabled = true;
             }
         }
 
@@ -1086,6 +1106,8 @@
             DirList: 60808,
             DirMake: 60809,
             DirRemove: 60810,
+            FilesystemFormat: 60811,
+            FilesystemDiskControl: 60812,
             FirmwareUpdate: 61000,
             FirmwareInstallProgress: 61001,
             GetFirmwareUpdateStatus: 61002,
@@ -1256,6 +1278,11 @@
             // Reboot { required RebootType reboot_type=1; }
             encodeReboot(rebootType) {
                 return new Uint8Array(this.encodeUint32(1, rebootType, true));
+            },
+
+            // FilesystemDiskControl { required uint32 enable=1; }
+            encodeDiskControl(enable) {
+                return new Uint8Array(this.encodeUint32(1, enable, true));
             },
         };
 
@@ -2102,6 +2129,63 @@
         function stopFileWriteTest() {
             fwTestAborted = true;
             log('[FileWriteTest] Stopping...', 'info');
+        }
+
+        const DISK_CTRL_NAME = { 0: 'Disable MSC', 1: 'Enable MSC' };
+
+        async function sendDiskControl() {
+            if (!device) {
+                log('Not connected!', 'error');
+                return;
+            }
+
+            const enable = parseInt(document.getElementById('diskCtrlEnable').value);
+
+            const infoDiv = document.getElementById('diskCtrlResult');
+            infoDiv.style.display = 'block';
+            document.getElementById('diskCtrlTxType').textContent = `${PB_MSG_TYPE.FilesystemDiskControl} (FilesystemDiskControl)`;
+            document.getElementById('diskCtrlRxType').textContent = 'waiting...';
+            document.getElementById('diskCtrlResultText').textContent = '-';
+
+            log(`💾 [DiskControl] ${DISK_CTRL_NAME[enable] || enable}`, 'info');
+
+            try {
+                const pbPayload = pbEncoder.encodeDiskControl(enable);
+                const resp = await sendPbMessage(PB_MSG_TYPE.FilesystemDiskControl, pbPayload);
+
+                document.getElementById('diskCtrlRxType').textContent = `${resp.msgType} (${PB_MSG_NAME[resp.msgType] || 'Unknown'})`;
+
+                if (resp.msgType === PB_MSG_TYPE.Success) {
+                    const decoded = pbDecoder.decodeSuccess(resp.pbPayload);
+                    document.getElementById('diskCtrlResultText').textContent = `Success: "${decoded.message || 'OK'}"`;
+                    log(`✅ [DiskControl] Success: "${decoded.message || 'OK'}"`, 'info');
+                    addStatusEntry('FilesystemDiskControl', {
+                        'enable': DISK_CTRL_NAME[enable] || enable,
+                        'rx_msg_type': `${resp.msgType}`
+                    }, 'Success', 0);
+                } else if (resp.msgType === PB_MSG_TYPE.Failure) {
+                    const failure = pbDecoder.decodeFailure(resp.pbPayload);
+                    document.getElementById('diskCtrlResultText').textContent = `Failure: code=${failure.code}, "${failure.message}"`;
+                    log(`❌ [DiskControl] Failure: code=${failure.code}, "${failure.message}"`, 'error');
+                    addStatusEntry('FilesystemDiskControl', {
+                        'enable': DISK_CTRL_NAME[enable] || enable
+                    }, `Failure: "${failure.message}"`, failure.code);
+                } else {
+                    document.getElementById('diskCtrlResultText').textContent = `Unexpected response type: ${resp.msgType}`;
+                    log(`❌ [DiskControl] Unexpected response type: ${resp.msgType}`, 'error');
+                    addStatusEntry('FilesystemDiskControl', {
+                        'enable': DISK_CTRL_NAME[enable] || enable,
+                        'rx_msg_type': `${resp.msgType}`
+                    }, `Unexpected response type: ${resp.msgType}`, -1);
+                }
+            } catch (error) {
+                log(`❌ [DiskControl] Error: ${error.message}`, 'error');
+                document.getElementById('diskCtrlRxType').textContent = 'error';
+                document.getElementById('diskCtrlResultText').textContent = `Error: ${error.message}`;
+                addStatusEntry('FilesystemDiskControl', {
+                    'enable': DISK_CTRL_NAME[enable] || enable
+                }, `Error: ${error.message}`, -1);
+            }
         }
 
         const REBOOT_TYPE_NAME = { 0: 'Normal', 1: 'Boardloader', 2: 'BootLoader' };

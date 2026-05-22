@@ -30,11 +30,13 @@ step1 - update romloader
 
 step2 - update resources
   1) connect device                       (timeout 60s)
-  2) wait for OneKey OS volume to appear on the host (timeout 30s), then wait 3s
-  3) copy ./assets to the OneKey OS MSC volume via copy_assets.py
+  2) sendDiskControl enable=1 (enable MSC), reply ignored, then wait 3s
+  3) wait for OneKey OS volume to appear on the host (timeout 30s), then wait 3s
+  4) copy ./assets to the OneKey OS MSC volume via copy_assets.py
        (pass the discovered mount as --dest, then wipe + mirror)
        wait 3 seconds after copy completes; on failure the workflow EXITS (no retry)
-  4) enter step3
+  5) connect device                       (timeout 60s)
+  6) sendDiskControl enable=0 (disable MSC), reply ignored, then wait 3s, then enter step3
 
 step3 - update bluetooth
   1) if device already connected, skip; else connect (timeout 60s)
@@ -156,6 +158,7 @@ from onekey_webusb import (
     PB_MSG_TYPE,
     PB_MSG_NAME,
     FW_TARGET_NAME,
+    DISK_CTRL_NAME,
     WebUsbDevice,
     encode_ping,
     encode_file,
@@ -164,6 +167,7 @@ from onekey_webusb import (
     encode_reboot,
     encode_path_info_query,
     encode_file_delete,
+    encode_disk_control,
     decode_path_info,
     decode_success,
     decode_failure,
@@ -193,7 +197,9 @@ COPY_ASSETS_TIMEOUT_S = 600
 COPY_ASSETS_WORKERS = 8
 STEP2_VOLUME_WAIT_S = 30  # timeout for OneKey OS volume to appear on host (step2)
 STEP2_POST_VOLUME_WAIT_S = 3  # delay after volume appears, before copy_assets (step2)
-STEP2_POST_COPY_WAIT_S = 3  # delay after copy_assets completes, before step3
+STEP2_POST_COPY_WAIT_S = 3  # delay after copy_assets completes, before next sub-step
+STEP2_POST_MSC_ENABLE_WAIT_S = 3  # delay after sendDiskControl(enable=1), before scanning volume
+STEP2_POST_MSC_DISABLE_WAIT_S = 3  # delay after sendDiskControl(enable=0), before step3
 STEP3_POST_PING_WAIT_S = 5  # delay after ping succeeds in step3, before next step
 STEP3_POST_COMPLETE_WAIT_S = 5  # delay at end of step3, before step4
 STEP4_POST_PING_WAIT_S = 5  # delay after ping succeeds in step4, before next step
@@ -695,6 +701,32 @@ def do_reboot(dev: WebUsbDevice, reboot_type: int = 0) -> bool:
         return False
 
 
+def do_disk_control(dev: WebUsbDevice, enable: int) -> bool:
+    """Send FilesystemDiskControl. enable=1 -> Enable MSC, enable=0 -> Disable MSC.
+    Returns True on Success reply, False otherwise.
+    """
+    label = DISK_CTRL_NAME.get(enable, str(enable))
+    log("INFO", f"FilesystemDiskControl enable={enable} ({label})")
+    try:
+        pb_payload = encode_disk_control(enable)
+        msg_type, payload = dev.send_and_recv(
+            PB_MSG_TYPE["FilesystemDiskControl"], pb_payload, timeout_ms=10000
+        )
+        if msg_type == PB_MSG_TYPE["Success"]:
+            decoded = decode_success(payload)
+            log("OK", f"FilesystemDiskControl success: \"{decoded['message']}\"")
+            return True
+        if msg_type == PB_MSG_TYPE["Failure"]:
+            decoded = decode_failure(payload)
+            log("FAIL", f"FilesystemDiskControl failure: code={decoded['code']} msg=\"{decoded['message']}\"")
+            return False
+        log("FAIL", f"FilesystemDiskControl unexpected msg_type={msg_type} ({PB_MSG_NAME.get(msg_type,'?')})")
+        return False
+    except Exception as e:
+        log("FAIL", f"FilesystemDiskControl exception: {e}")
+        return False
+
+
 # ==================== standalone prelude ====================
 
 def run_standalone_prelude(step_label: str) -> Optional[WebUsbDevice]:
@@ -940,21 +972,28 @@ def run_step2_once(attempt_no: int, dev_in: Optional[WebUsbDevice] = None) -> bo
     try:
         substep("2.1", "Ensure device connected (reuse if already connected, else connect 60s)")
         if dev is None:
-            dev = wait_connect(CONNECT_TIMEOUT_S, label="step2.connect")
+            dev = wait_connect(CONNECT_TIMEOUT_S, label="step2.connect-1")
         else:
             log("INFO", "Device already connected; reusing existing handle")
 
-        substep("2.2", f"Wait for OneKey OS volume (timeout {STEP2_VOLUME_WAIT_S}s), then wait {STEP2_POST_VOLUME_WAIT_S}s")
+        substep("2.2", f"sendDiskControl enable=1 (Enable MSC) [result ignored], then wait {STEP2_POST_MSC_ENABLE_WAIT_S}s")
+        # workflow.md step2.2: 不判断返回结果。Older firmware may reply
+        # "Handler not registered" because it auto-exposes MSC anyway.
+        do_disk_control(dev, enable=1)
         # Release the WebUSB handle so the OS can mount MSC for copy_assets.
         safe_close(dev)
         dev = None
+        log("INFO", f"MSC enable issued, waiting {STEP2_POST_MSC_ENABLE_WAIT_S}s for host to mount the disk...")
+        time.sleep(STEP2_POST_MSC_ENABLE_WAIT_S)
+
+        substep("2.3", f"Wait for OneKey OS volume (timeout {STEP2_VOLUME_WAIT_S}s), then wait {STEP2_POST_VOLUME_WAIT_S}s")
         mount = wait_for_volume(ONEKEY_VOLUME_LABEL, STEP2_VOLUME_WAIT_S)
         if mount is None:
             return False
         log("INFO", f"Volume ready, waiting {STEP2_POST_VOLUME_WAIT_S}s before copy_assets...")
         time.sleep(STEP2_POST_VOLUME_WAIT_S)
 
-        substep("2.3", f"Copy ./assets to {mount} via copy_assets.py, then wait {STEP2_POST_COPY_WAIT_S}s")
+        substep("2.4", f"Copy ./assets to {mount} via copy_assets.py, then wait {STEP2_POST_COPY_WAIT_S}s")
         if not os.path.isdir(ASSETS_DIR):
             raise WorkflowFatal(f"Assets dir missing: {ASSETS_DIR}")
         if not os.path.isfile(COPY_ASSETS_SCRIPT):
@@ -964,8 +1003,17 @@ def run_step2_once(attempt_no: int, dev_in: Optional[WebUsbDevice] = None) -> bo
             # workflow.md: any failure here -> EXIT (no retry)
             raise WorkflowFatal("copy_assets.py failed; aborting workflow.")
 
-        log("INFO", f"Asset copy done, waiting {STEP2_POST_COPY_WAIT_S}s before step3...")
+        log("INFO", f"Asset copy done, waiting {STEP2_POST_COPY_WAIT_S}s before reconnect...")
         time.sleep(STEP2_POST_COPY_WAIT_S)
+
+        substep("2.5", "Reconnect device (timeout 60s)")
+        dev = wait_connect(CONNECT_TIMEOUT_S, label="step2.connect-2")
+
+        substep("2.6", f"sendDiskControl enable=0 (Disable MSC) [result ignored], then wait {STEP2_POST_MSC_DISABLE_WAIT_S}s")
+        # workflow.md step2.6: 不判断返回结果.
+        do_disk_control(dev, enable=0)
+        log("INFO", f"MSC disable issued, waiting {STEP2_POST_MSC_DISABLE_WAIT_S}s before step3...")
+        time.sleep(STEP2_POST_MSC_DISABLE_WAIT_S)
 
         log("OK", "Step2 finished.")
         return True
@@ -1030,14 +1078,14 @@ def run_step3_once(attempt_no: int, dev_in: Optional[WebUsbDevice] = None) -> bo
 
         substep("3.3", "Ensure vol0:bluetooth.bin exists (write bin/pro2_bluetooth_signed.bin if missing or query timed out)")
         info = do_path_info(dev, "vol0:bluetooth.bin")
-        # workflow.md: 如果指令超时或者不存在 -> write the bin. info=None covers
-        # PathInfo timeout / Failure / unexpected reply; treat all as "needs write".
+        # workflow.md step3.3: 如果指令超时或者不存在 -> write the bin.
+        # info=None covers PathInfo timeout / Failure / unexpected reply.
         needs_write = info is None or not info.get("exist", False)
         if not needs_write:
             log("INFO", "vol0:bluetooth.bin already exists; skipping file_write")
         else:
             if info is None:
-                log("INFO", "PathInfo query failed/timed out for vol0:bluetooth.bin; treating as missing and writing")
+                log("INFO", "PathInfo for vol0:bluetooth.bin failed/timed out; treating as missing and writing")
             else:
                 log("INFO", f"vol0:bluetooth.bin missing; writing {BLUETOOTH_BIN}")
             if not os.path.isfile(BLUETOOTH_BIN):
@@ -1127,14 +1175,14 @@ def run_step4_once(attempt_no: int) -> bool:
 
         substep("4.5", "Ensure vol0:core.bin exists (write bin/pro2_firmware_signed.bin if missing or query timed out)")
         info = do_path_info(dev, "vol0:core.bin")
-        # workflow.md: 如果指令超时或者不存在 -> write the bin. info=None covers
-        # PathInfo timeout / Failure / unexpected reply; treat all as "needs write".
+        # workflow.md step4.5: 如果指令超时或者不存在 -> write the bin.
+        # info=None covers PathInfo timeout / Failure / unexpected reply.
         needs_write = info is None or not info.get("exist", False)
         if not needs_write:
             log("INFO", "vol0:core.bin already exists; skipping file_write")
         else:
             if info is None:
-                log("INFO", "PathInfo query failed/timed out for vol0:core.bin; treating as missing and writing")
+                log("INFO", "PathInfo for vol0:core.bin failed/timed out; treating as missing and writing")
             else:
                 log("INFO", f"vol0:core.bin missing; writing {FIRMWARE_BIN}")
             if not os.path.isfile(FIRMWARE_BIN):
